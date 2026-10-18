@@ -1,0 +1,323 @@
+import os
+import copy
+import time
+import tempfile
+from typing import List, Optional
+import pymupdf as fitz
+from fastapi import APIRouter, Request, HTTPException, Response
+
+from services.page_geometry import extract_page_geometry
+from services.spatial_cluster import SpatialClusterer, ParagraphBlock
+from services.obj_reflow import TextReflowEngine
+from services.compiler import PDFCompiler
+from services.erase_service import safe_erase
+from services.font_service import (
+    new_cache,
+    reset_cache,
+    font_chain,
+    register_font_name,
+    rgb,
+)
+
+router = APIRouter()
+
+TMP_DIR = tempfile.mkdtemp(prefix="pdfsurgeon_fastapi_")
+MAX_PX = 4000
+ZOOM = 1.6
+MAX_UNDO = 15
+
+# Global session state using your new_cache()
+STATE = {
+    "doc": None,
+    "pw": "",
+    "undo": [],
+    "ghost": {},
+    "cached_blocks": {},  # page_idx -> List[ParagraphBlock]
+    "cache": new_cache(),
+}
+
+
+def take_snapshot():
+    if not STATE["doc"]:
+        return
+    snap_path = os.path.join(TMP_DIR, f"u{time.time_ns()}.pdf")
+    STATE["doc"].save(snap_path)
+    STATE["undo"].append((snap_path, copy.deepcopy(STATE["ghost"])))
+    while len(STATE["undo"]) > MAX_UNDO:
+        try:
+            os.remove(STATE["undo"].pop(0)[0])
+        except OSError:
+            pass
+
+
+def zoom_of(page: fitz.Page) -> float:
+    return min(ZOOM, MAX_PX / max(page.rect.width, page.rect.height))
+
+
+def find_target_block(blocks: List[ParagraphBlock], op: dict) -> Optional[ParagraphBlock]:
+    if not blocks:
+        return None
+
+    block_id = op.get("block_id")
+    op_bbox = op.get("bbox", [])
+    old_text = op.get("old", "").strip()
+
+    # 1. Match by explicit block_id if valid
+    if block_id is not None and isinstance(block_id, int) and 0 <= block_id < len(blocks):
+        candidate = blocks[block_id]
+        if not op_bbox:
+            return candidate
+        if max(abs(a - c) for a, c in zip(candidate.bbox, op_bbox)) < 25.0:
+            return candidate
+
+    # 2. Match by normalized whitespace / newline text
+    norm_old = " ".join(old_text.split())
+    if norm_old:
+        for b in blocks:
+            norm_b = " ".join(b.text.strip().split())
+            if norm_b == norm_old:
+                return b
+
+    # 3. Match by 2D center-point proximity (spatial nearest neighbor)
+    if op_bbox and len(op_bbox) == 4:
+        c_x = (op_bbox[0] + op_bbox[2]) / 2.0
+        c_y = (op_bbox[1] + op_bbox[3]) / 2.0
+
+        def center_dist_sq(b: ParagraphBlock):
+            bx = (b.bbox[0] + b.bbox[2]) / 2.0
+            by = (b.bbox[1] + b.bbox[3]) / 2.0
+            return (bx - c_x) ** 2 + (by - c_y) ** 2
+
+        best_block = min(blocks, key=center_dist_sq)
+        if center_dist_sq(best_block) < 10000:
+            return best_block
+
+    # 4. Substring fallback
+    if norm_old:
+        for b in blocks:
+            norm_b = " ".join(b.text.strip().split())
+            if norm_old in norm_b or norm_b in norm_old:
+                return b
+
+    return blocks[0]
+
+
+@router.post("/open")
+async def open_pdf(request: Request, password: str = ""):
+    body = await request.body()
+    doc_path = os.path.join(TMP_DIR, "doc.pdf")
+    with open(doc_path, "wb") as f:
+        f.write(body)
+
+    try:
+        doc = fitz.open(doc_path)
+    except Exception:
+        raise HTTPException(status_code=400, detail="This file is not a readable PDF.")
+
+    if doc.needs_pass and not doc.authenticate(password):
+        raise HTTPException(status_code=401, detail="password")
+    if doc.page_count == 0:
+        raise HTTPException(status_code=400, detail="This PDF has no pages.")
+
+    reset_cache(STATE["cache"])
+    STATE.update(doc=doc, pw=password, undo=[], ghost={}, cached_blocks={})
+
+    pages = []
+    for pg in doc:
+        w, h = pg.rect.width, pg.rect.height
+        pages.append({"w": w, "h": h, "z": zoom_of(pg)})
+
+    return {"pages": pages}
+
+
+@router.get("/pageimg/{page_idx}")
+def get_page_image(page_idx: int):
+    doc = STATE.get("doc")
+    if not doc or page_idx >= len(doc):
+        raise HTTPException(status_code=404, detail="Page not found")
+
+    pg = doc[page_idx]
+    z = zoom_of(pg)
+    pix = pg.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+    return Response(content=pix.tobytes("png"), media_type="image/png")
+
+
+@router.get("/text/{page_idx}")
+def get_page_text(page_idx: int):
+    doc = STATE.get("doc")
+    if not doc or page_idx >= len(doc):
+        raise HTTPException(status_code=404, detail="Page not found")
+
+    geom = extract_page_geometry(doc, page_idx)
+    clusterer = SpatialClusterer()
+    blocks = clusterer.process(geom)
+    STATE["cached_blocks"][page_idx] = blocks
+
+    pg = doc[page_idx]
+    out = []
+    for idx, p in enumerate(blocks):
+        db = fitz.Rect(p.bbox) * pg.rotation_matrix
+        dominant_font = (
+            p.lines[0].tokens[0].font_name
+            if (p.lines and p.lines[0].tokens)
+            else "helv"
+        )
+        dominant_size = p.lines[0].dominant_font_size if p.lines else 11.0
+        flags = (
+            p.lines[0].tokens[0].flags
+            if (p.lines and p.lines[0].tokens)
+            else 0
+        )
+
+        out.append({
+            "id": idx,
+            "text": p.text,
+            "bbox": list(p.bbox),
+            "dbox": list(db),
+            "font": dominant_font,
+            "size": dominant_size,
+            "flags": flags,
+        })
+    return out
+
+
+@router.post("/edit")
+async def apply_edit(request: Request):
+    doc = STATE.get("doc")
+    if not doc:
+        raise HTTPException(status_code=400, detail="No document loaded")
+
+    op = await request.json()
+    op_type = op.get("type")
+    page_num = int(op.get("page", 0))
+    if page_num >= len(doc):
+        raise HTTPException(status_code=400, detail="Invalid page number")
+
+    page = doc[page_num]
+    take_snapshot()
+
+    try:
+        if op_type == "line":
+            old_text = op.get("old", "")
+            new_text = op.get("new", "")
+            if old_text == new_text:
+                return {"unchanged": True, "missing": "", "note": ""}
+
+            blocks = STATE["cached_blocks"].get(page_num, [])
+            if not blocks:
+                geom = extract_page_geometry(doc, page_num)
+                clusterer = SpatialClusterer()
+                blocks = clusterer.process(geom)
+                STATE["cached_blocks"][page_num] = blocks
+
+            target_block = find_target_block(blocks, op)
+            if not target_block:
+                raise ValueError("Could not resolve target block on page.")
+
+            f_size = (
+                target_block.lines[0].dominant_font_size
+                if target_block.lines
+                else 11.0
+            )
+            first_baseline = (
+                target_block.lines[0].baseline_y
+                if target_block.lines
+                else target_block.bbox[1] + 10.0
+            )
+
+            if len(target_block.lines) == 1 and "\n" not in new_text:
+                # one-line cell (amount, label, heading): never re-wrap it
+                reflow_res = TextReflowEngine.single_line(new_text, target_block.bbox, first_baseline)
+            else:
+                engine = TextReflowEngine(font_name="helv", font_size=f_size)
+                reflow_res = engine.reflow_paragraph(
+                    new_text=new_text,
+                    original_bbox=target_block.bbox,
+                    initial_baseline_y=first_baseline,
+                    page_width=float(page.rect.width),
+                )
+
+            compiler = PDFCompiler(doc, cache=STATE["cache"])
+            report = compiler.apply_edit_and_cascade(
+                page_num=page_num,
+                target_block=target_block,
+                reflow_res=reflow_res,
+                all_blocks=blocks,
+                new_text=new_text,
+            )
+            return {"missing": report["substituted"], "note": "Edit applied"}
+
+        elif op_type == "add":
+            dm = page.derotation_matrix
+            pt = fitz.Point(op["x"], op["y"]) * dm
+            fam = {"sans": "helv", "serif": "tiro", "mono": "cour"}.get(
+                op.get("family"), "helv"
+            )
+            flags = (16 if op.get("bold") else 0) | (2 if op.get("italic") else 0)
+            chain = font_chain(doc, page, fam, flags, cache=STATE["cache"])
+            font_res = register_font_name(page, chain[0], cache=STATE["cache"])
+
+            page.insert_text(
+                pt,
+                op["text"],
+                fontname=font_res,
+                fontsize=float(op.get("size", 12)),
+                color=rgb(int(op.get("color", 0))),
+            )
+            return {"missing": "", "note": ""}
+
+        elif op_type == "cover":
+            r = fitz.Rect(op["rect"]) * page.derotation_matrix
+            r.normalize()
+            if r.width >= 1 and r.height >= 1:
+                safe_erase(page, r, fill_bg=True, images=2)
+            return {"missing": "", "note": ""}
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown op type: {op_type}")
+
+    except Exception as e:
+        if STATE["undo"]:
+            undo_pdf()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/undo")
+def undo_pdf():
+    if not STATE["undo"]:
+        raise HTTPException(status_code=400, detail="Nothing to undo")
+
+    p, gh = STATE["undo"].pop()
+    STATE["doc"].close()
+    d = fitz.open(p)
+    if d.needs_pass:
+        d.authenticate(STATE["pw"])
+    STATE["doc"] = d
+    STATE["ghost"] = gh
+    STATE["cached_blocks"] = {}
+    reset_cache(STATE["cache"])
+    return {"status": "undone"}
+
+
+@router.get("/save")
+def save_pdf():
+    doc = STATE.get("doc")
+    if not doc:
+        raise HTTPException(status_code=400, detail="No document loaded")
+
+    data = None
+    if not doc.is_encrypted:
+        try:
+            d2 = fitz.open("pdf", doc.tobytes())
+            d2.subset_fonts()
+            data = d2.tobytes(garbage=3, deflate=True)
+            d2.close()
+        except Exception:
+            data = None
+
+    final_bytes = data or doc.tobytes(garbage=3, deflate=True)
+    return Response(
+        content=final_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=edited.pdf"},
+    )

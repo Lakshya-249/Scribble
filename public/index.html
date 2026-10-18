@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Surgeon</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", Arial, sans-serif; background:#1e1f24; color:#e8e8ea; display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+  header { display:flex; align-items:center; gap:6px; padding:8px 14px; background:#2a2b32; border-bottom:1px solid #3a3b44; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin-right:10px; color:#fff; }
+  .sep { width:1px; height:22px; background:#3a3b44; margin:0 6px; }
+  .btn { background:#3a3b44; color:#e8e8ea; border:1px solid #4a4b55; border-radius:6px; padding:6px 11px; font-size:13px; cursor:pointer; }
+  .btn:hover:not(:disabled) { background:#4a4b55; }
+  .btn:disabled { opacity:.4; cursor:default; }
+  .btn.on { background:#4f7cff; border-color:#4f7cff; color:#fff; }
+  .btn.primary { background:#4f7cff; border-color:#4f7cff; color:#fff; font-weight:600; }
+  .btn:focus-visible, select:focus-visible, input:focus-visible { outline:2px solid #9db5ff; outline-offset:1px; }
+  select, input[type=number] { background:#3a3b44; color:#e8e8ea; border:1px solid #4a4b55; border-radius:6px; padding:5px 6px; font-size:13px; }
+  input[type=number] { width:58px; }
+  input[type=color] { width:30px; height:28px; border:1px solid #4a4b55; border-radius:6px; background:none; padding:1px; }
+  #addopts { display:none; align-items:center; gap:6px; }
+  #addopts.show { display:flex; }
+  #status { margin-left:auto; font-size:12px; color:#9a9ba5; max-width:40vw; text-align:right; }
+  main { flex:1; overflow:auto; padding:24px; }
+  #empty { margin:15vh auto 0; color:#9a9ba5; text-align:center; max-width:520px; line-height:1.5; }
+  #empty h2 { color:#e8e8ea; margin-bottom:10px; }
+  .pageWrap { position:relative; margin:0 auto 24px; box-shadow:0 4px 18px rgba(0,0,0,.5); background:#fff; line-height:0; max-width:none; }
+  .pageWrap img { display:block; position:absolute; inset:0; width:100%; height:100%; user-select:none; -webkit-user-drag:none; }
+  .hit { position:absolute; white-space:pre; color:transparent; line-height:1; cursor:text; }
+  .tool-edit .hit:hover { background:rgba(79,124,255,.28); }
+  .tool-add .hit, .tool-cover .hit { pointer-events:none; }
+  .tool-add .pageWrap { cursor:crosshair; }
+  .tool-cover .pageWrap { cursor:cell; }
+  .rubber { position:absolute; border:2px dashed #4f7cff; background:rgba(79,124,255,.18); pointer-events:none; }
+  textarea.inplace { position:absolute; z-index:20; background:#16171b; color:#fff; border:2px solid #4f7cff; border-radius:6px; box-shadow:0 6px 20px rgba(0,0,0,.5); outline:none; resize:none; overflow:hidden; padding:4px 8px; line-height:1.3; white-space:pre; font:15px -apple-system,"Segoe UI",Arial,sans-serif; }
+  textarea.inplace.ghost { background:transparent; box-shadow:none; border:1px dashed #4f7cff; border-radius:0; padding:0 2px; }
+  .hit.editing { outline:2px solid #4f7cff; background:rgba(79,124,255,.15); }
+  #fileInput { display:none; }
+</style>
+</head>
+<body class="tool-edit">
+<header>
+  <h1>🩺 PDF Surgeon</h1>
+  <button class="btn" id="openBtn">📂 Open</button>
+  <button class="btn" id="undoBtn" disabled title="Ctrl+Z">↩ Undo</button>
+  <span class="sep"></span>
+  <button class="btn on" data-tool="edit" title="Click any text to change it">Edit text</button>
+  <button class="btn" data-tool="add" title="Click anywhere to type new text">Add text</button>
+  <button class="btn" data-tool="cover" title="Drag a box to erase text or scanned content">Erase area</button>
+  <span id="addopts">
+    <select id="family"><option value="sans">Sans</option><option value="serif">Serif</option><option value="mono">Mono</option></select>
+    <input type="number" id="size" value="12" min="4" max="200" title="Size (pt)">
+    <input type="color" id="color" value="#000000" title="Text colour">
+    <button class="btn" id="bold"><b>B</b></button>
+    <button class="btn" id="italic"><i>I</i></button>
+  </span>
+  <span class="sep"></span>
+  <button class="btn primary" id="saveBtn" disabled>💾 Save PDF</button>
+  <span id="status">local only — your file never leaves this machine</span>
+  <input type="file" id="fileInput" accept="application/pdf,.pdf">
+</header>
+<main id="main">
+  <div id="empty">
+    <h2>Open a PDF to start editing</h2>
+    <p>Edit text keeps the original font whenever it is stored in the file. If a letter is missing from that font, the same font on this computer or the closest match fills in, and the status bar tells you. Scanned pages have no text — use Erase area, then Add text.</p>
+  </div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const main = $("#main"), st = $("#status");
+let pages = [], tool = "edit", busy = false, active = null, bold = false, italic = false;
+const setStatus = t => st.textContent = t;
+
+// ---------- open
+$("#openBtn").onclick = () => $("#fileInput").click();
+$("#fileInput").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return; e.target.value = "";
+  let pw = "";
+  for (;;) {
+    setStatus("loading…");
+    const r = await fetch("/open?password=" + encodeURIComponent(pw), { method: "POST", body: f });
+    const d = await r.json();
+    if (r.ok) { pages = d.pages; break; }
+    if (r.status === 401) {
+      pw = prompt(pw ? "Wrong password. Try again:" : "This PDF is password-protected. Password:");
+      if (pw === null) return setStatus("cancelled");
+      continue;
+    }
+    return setStatus("❌ " + (d.error || "could not open file"));
+  }
+  build();
+  $("#saveBtn").disabled = false; $("#undoBtn").disabled = false;
+  setStatus(`${pages.length} page(s) — ${f.name}`);
+};
+
+// ---------- pages (rendered lazily so huge PDFs stay fast)
+const io = new IntersectionObserver(es => es.forEach(en => {
+  if (en.isIntersecting && !en.target.dataset.loaded) { en.target.dataset.loaded = 1; refresh(en.target); }
+}), { root: main, rootMargin: "1500px 0px" });
+
+function build() {
+  main.innerHTML = "";
+  pages.forEach((p, i) => {
+    const w = document.createElement("div");
+    w.className = "pageWrap"; w.dataset.page = i;
+    w.style.width = p.w * p.z + "px"; w.style.height = p.h * p.z + "px";
+    wire(w, i); main.appendChild(w); io.observe(w);
+  });
+}
+
+async function refresh(wrap) {
+  const i = +wrap.dataset.page, z = pages[i].z, t = Date.now();
+  let img = wrap.querySelector("img");
+  if (!img) { img = new Image(); img.alt = ""; img.draggable = false; wrap.prepend(img); }
+  img.src = `/pageimg/${i}?t=${t}`;
+  const r = await fetch(`/text/${i}`);
+  if (!r.ok) return;
+  wrap.querySelectorAll(".hit").forEach(h => h.remove());
+  (await r.json()).forEach(s => {
+    const d = document.createElement("div");
+    d.className = "hit";
+    const b = s.dbox;
+    d.style.cssText = `left:${b[0]*z}px;top:${b[1]*z}px;width:${(b[2]-b[0])*z}px;height:${(b[3]-b[1])*z}px;font-size:${s.size*z}px`;
+    d._m = s; wrap.appendChild(d);
+  });
+}
+
+// ---------- tools
+document.querySelectorAll("[data-tool]").forEach(b => b.onclick = () => {
+  commit(); tool = b.dataset.tool;
+  document.querySelectorAll("[data-tool]").forEach(x => x.classList.toggle("on", x === b));
+  document.body.className = "tool-" + tool;
+  $("#addopts").classList.toggle("show", tool === "add");
+});
+$("#bold").onclick = e => { bold = !bold; e.currentTarget.classList.toggle("on", bold); };
+$("#italic").onclick = e => { italic = !italic; e.currentTarget.classList.toggle("on", italic); };
+
+function pt(wrap, e) {
+  const r = wrap.getBoundingClientRect(), z = pages[+wrap.dataset.page].z;
+  return [(e.clientX - r.left) / z, (e.clientY - r.top) / z];
+}
+
+function wire(wrap, i) {
+  const z = pages[i].z;
+  let drag = null, box = null;
+  wrap.addEventListener("click", e => {
+    if (e.target.tagName === "TEXTAREA") return;
+    if (tool === "edit" && e.target._m) editBox(wrap, i, e.target);
+    if (tool === "add") addBox(wrap, i, ...pt(wrap, e));
+  });
+  wrap.addEventListener("mousedown", e => {
+    if (tool !== "cover" || e.button) return;
+    commit(); e.preventDefault();
+    drag = pt(wrap, e); box = document.createElement("div"); box.className = "rubber"; wrap.appendChild(box);
+  });
+  window.addEventListener("mousemove", e => {
+    if (!drag || !box) return;
+    const p = pt(wrap, e), x = Math.min(drag[0], p[0]), y = Math.min(drag[1], p[1]);
+    box.style.cssText = `left:${x*z}px;top:${y*z}px;width:${Math.abs(p[0]-drag[0])*z}px;height:${Math.abs(p[1]-drag[1])*z}px`;
+  });
+  window.addEventListener("mouseup", e => {
+    if (!drag || !box) return;
+    const p = pt(wrap, e), a = drag; drag = null; box.remove(); box = null;
+    if (Math.abs(p[0] - a[0]) < 2 || Math.abs(p[1] - a[1]) < 2) return;
+    send({ type: "cover", page: i, rect: [Math.min(a[0], p[0]), Math.min(a[1], p[1]), Math.max(a[0], p[0]), Math.max(a[1], p[1])] }, wrap);
+  });
+}
+
+// ---------- in-place editors
+// ---------- in-place editors (Allows multi-line & Enter key)
+function mkTA(wrap, x, y, w, h, ghost, fs, family, color) {
+  commit();
+  const ta = document.createElement("textarea");
+  ta.className = "inplace" + (ghost ? " ghost" : "");
+  ta.wrap = "soft";            // Allow natural wrapping
+  ta.rows = 2;
+  ta.spellcheck = false;
+  ta.style.cssText = `left:${x}px;top:${y}px;width:${w}px;min-height:${h}px` +
+    (ghost ? `;font-size:${fs}px;font-family:${family};color:${color}` : "");
+
+  wrap.appendChild(ta);
+
+  ta.addEventListener("keydown", ev => {
+    ev.stopPropagation();
+    if (ev.key === "Escape") {
+      ta.dataset.cancel = 1;
+      ta.blur();
+    }
+    // Press Ctrl+Enter or Cmd+Enter to commit; plain Enter creates a newline!
+    if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+      ev.preventDefault();
+      ta.blur();
+    }
+  });
+
+  // Auto-grow height as user types or adds newlines
+  ta.addEventListener("input", () => {
+    ta.style.height = "auto";
+    ta.style.height = (ta.scrollHeight + 4) + "px";
+  });
+
+  ta.addEventListener("blur", commit);
+  return ta;
+}
+
+function editBox(wrap, i, hit) {
+  const m = hit._m, z = pages[i].z, b = m.dbox;
+  // Give comfortable width across the line
+  const availableW = (pages[i].w - b[0] - 30) * z;
+  const w = Math.max(320, Math.min(availableW, (b[2] - b[0]) * z + 120));
+  const h = Math.max(38, (b[3] - b[1]) * z + 8);
+  const top = b[1] * z - 4;
+
+  const ta = mkTA(wrap, Math.max(0, b[0] * z - 4), top, w, h, false);
+  ta.value = m.text;
+  ta.focus();
+  ta.select();
+  hit.classList.add("editing");
+  active = { ta, wrap, hit, kind: "line", i, m };
+}
+
+// function editBox(wrap, i, hit) {
+//   const m = hit._m, z = pages[i].z, b = m.dbox;
+//   const w = Math.max(280, (b[2]-b[0])*z + 80), top = b[1]*z - 46;
+//   const ta = mkTA(wrap, Math.max(0, b[0]*z - 8), top < 4 ? b[3]*z + 8 : top, w, 36, false);
+//   ta.value = m.text; ta.focus(); ta.select(); hit.classList.add("editing");
+//   active = { ta, wrap, hit, kind: "line", i, m };
+// }
+
+function addBox(wrap, i, x, y) {
+  const z = pages[i].z, size = +$("#size").value || 12;
+  const ta = mkTA(wrap, x*z, y*z, 260, size*z*1.3 + 4, true, size*z, $("#family").value === "mono" ? "monospace" : $("#family").value === "serif" ? "serif" : "sans-serif", $("#color").value);
+  ta.focus(); active = { ta, wrap, kind: "add", i, x, y, size };
+}
+
+async function commit() {
+  if (!active) return;
+  const a = active; active = null;
+  const text = a.ta.value, cancel = a.ta.dataset.cancel; a.ta.remove();
+  if (a.hit) a.hit.classList.remove("editing");
+  if (cancel || !text.trim() && a.kind === "add" || a.kind === "line" && text === a.m.text) return;
+  if (a.kind === "line")
+    await send({
+      type: "line",
+      page: a.i,
+      block_id: a.m.id,
+      bbox: a.m.bbox,
+      old: a.m.text,
+      new: text
+    }, a.wrap);
+  else
+    await send({
+      type: "add",
+      page: a.i,
+      x: a.x,
+      y: a.y + a.size * 0.8,
+      text,
+      size: a.size,
+      family: $("#family").value,
+      bold,
+      italic,
+      color: parseInt($("#color").value.slice(1), 16)
+    }, a.wrap);
+}
+
+
+let chain = Promise.resolve();
+const send = (op, wrap) => (chain = chain.then(() => doSend(op, wrap)));
+async function doSend(op, wrap) {
+  busy = true; setStatus("applying…");
+  try {
+    const r = await fetch("/edit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(op) });
+    const d = await r.json();
+    if (!r.ok) return setStatus("❌ " + d.error);
+    if (d.unchanged) return setStatus("no change");
+    await refresh(wrap);
+    setStatus(d.missing ? `✓ applied — "${d.missing}" not in the original font, closest match used. Remember to Save.` : "✓ applied — remember to Save PDF");
+  } catch (e) { setStatus("❌ " + e.message); }
+  finally { busy = false; }
+}
+
+// ---------- undo / save
+async function undo() {
+  commit(); if (busy) return; busy = true;
+  try {
+    const r = await fetch("/undo", { method: "POST" });
+    if (!r.ok) return setStatus("Nothing to undo");
+    for (const w of main.querySelectorAll(".pageWrap[data-loaded]")) await refresh(w);
+    setStatus("undone");
+  } finally { busy = false; }
+}
+$("#undoBtn").onclick = undo;
+addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) { e.preventDefault(); undo(); } });
+
+$("#saveBtn").onclick = async () => {
+  await commit(); setStatus("saving…");
+  const r = await fetch("/save");
+  if (!r.ok) return setStatus("❌ save failed");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(await r.blob()); a.download = "edited.pdf"; a.click();
+  setStatus("✅ downloaded edited.pdf");
+};
+</script>
+</body>
+</html>
