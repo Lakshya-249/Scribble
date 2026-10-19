@@ -40,9 +40,6 @@ def drift(before, after, skip: fitz.Rect):
 
 
 def unghost(items, ghost, key):
-    """items minus ONE item per matching ghost entry ([char, x, y]). Counting matters: when new
-    text is drawn exactly over hidden old text both exist in the file; the hidden copy must go
-    and the new one must stay."""
     if not ghost:
         return list(items)
     idx = collections.defaultdict(list)
@@ -111,10 +108,6 @@ def _redact(page: fitz.Page, r: fitz.Rect, fill, images: int):
 
 
 def _redaction_is_safe(page: fitz.Page, r: fitz.Rect, fill, images: int, before) -> bool:
-    """Dry-run the redaction on a throw-away one-page copy and check that no glyph outside
-    r moved. MuPDF rewrites the page's content stream when it redacts, and on some PDFs that
-    shifts unrelated letters (first letters / kerned pairs squashed together). Trying it on a
-    copy means the real page is never damaged, so nothing has to be rolled back."""
     tmp = fitz.open()
     try:
         tmp.insert_pdf(page.parent, from_page=page.number, to_page=page.number)
@@ -122,19 +115,19 @@ def _redaction_is_safe(page: fitz.Page, r: fitz.Rect, fill, images: int, before)
         _redact(tp, r, fill, images)
         return not drift(before, char_sig(tp), r + (-1.5, -1.5, 1.5, 1.5))
     except Exception:
-        return False          # when in doubt, do not rewrite the stream
+        return False
     finally:
         tmp.close()
 
 
+def erase_underline_rect(page: fitz.Page, rect: tuple):
+    """Cleanly erases old vector underlines by expanding the erase clip safely."""
+    r = fitz.Rect(rect) + (-1.5, -2.0, 1.5, 2.0)
+    bg = sample_bg(page, r, pad=2.0)
+    page.draw_rect(r, color=None, fill=bg, overlay=True)
+
+
 def safe_erase(page: fitz.Page, rect: fitz.Rect, fill_bg: bool = False, images: int = 0, ghost: list = None):
-    """
-    Removes the content inside `rect`.
-      1. dry-run the real redaction on a copy; if nothing else moves, apply it to the page;
-      2. otherwise hide the area with a clip + background fill, which leaves every other byte
-         of the page alone. The hidden glyphs are appended to `ghost` as [char, x, y] so the
-         editor can ignore them instead of showing old and new text together.
-    """
     r = fitz.Rect(rect)
     before = char_sig(page)
     bg = sample_bg(page, r) if fill_bg else None
@@ -145,13 +138,7 @@ def safe_erase(page: fitz.Page, rect: fitz.Rect, fill_bg: bool = False, images: 
 
     hide_rect(page, r, bg or sample_bg(page, r))
     if ghost is not None:
-        fresh = unghost(before, ghost, lambda t: (t[0], t[1], t[2]))     # not already hidden
+        fresh = unghost(before, ghost, lambda t: (t[0], t[1], t[2]))
         ghost.extend([c, x, y] for c, x, y, bb in fresh
                      if r.contains(fitz.Point((bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2)))
     return "clipped"
-
-def erase_underline_rect(page: fitz.Page, rect: fitz.Rect):
-    """Erases a thin vector underline rectangle cleanly without shifting any text."""
-    r = fitz.Rect(rect) + (-0.5, -0.5, 0.5, 0.5)
-    bg = sample_bg(page, r, pad=1.5)
-    page.draw_rect(r, color=None, fill=bg, overlay=True)

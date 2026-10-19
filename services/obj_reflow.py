@@ -63,25 +63,17 @@ class TextReflowEngine:
         right_margin: float = 50.0,
         container_max_x1: Optional[float] = None,
         first_line_indent: float = 0.0,
+        hanging_indent: float = 0.0,
         alignment: str = "left",
         original_line_baselines: Optional[List[float]] = None,
+        original_line_lefts: Optional[List[float]] = None,
     ) -> ReflowResult:
         x0, y0, x1, y1 = original_bbox
         original_width = x1 - x0
-        original_height = y1 - y0
 
-        # If it is a multi-line paragraph, strictly keep its original width so it never shrinks
-        # or overflows into adjacent columns. Only allow expansion up to container_max_x1 for short 1-line blocks.
-        if original_line_baselines and len(original_line_baselines) >= 2:
-            max_allowed_width = original_width
-        elif container_max_x1 is not None:
-            max_allowed_width = max(original_width, container_max_x1 - x0)
-        else:
-            available_page_width = max(original_width, page_width - x0 - right_margin)
-            max_allowed_width = original_width if original_width > 200.0 else available_page_width
+        max_allowed_width = container_max_x1 - x0 if container_max_x1 else original_width
 
         paragraphs_or_lines = new_text.split("\n")
-        # Tuple of (line_str, is_last_in_subpara, is_first_in_subpara)
         final_lines: List[Tuple[str, bool, bool]] = []
 
         for segment in paragraphs_or_lines:
@@ -95,9 +87,9 @@ class TextReflowEngine:
             for word in words:
                 test_line = " ".join(current_line + [word]) if current_line else word
                 line_w = self.measure_text_width(test_line)
-                line_limit = max_allowed_width - (first_line_indent if is_first else 0.0)
+                left_offset = first_line_indent if is_first else hanging_indent
+                line_limit = max_allowed_width - left_offset
 
-                # Allow tiny 1.5pt tolerance so unchanged lines with exact width don't prematurely wrap
                 if line_w <= (line_limit + 1.5) or not current_line:
                     current_line.append(word)
                 else:
@@ -113,14 +105,18 @@ class TextReflowEngine:
         max_line_width = 0.0
 
         for idx, (line_str, is_last, is_first) in enumerate(final_lines):
-            # Use the exact original baseline Y for existing line indices to guarantee zero vertical drift!
+            # LOCK TO EXACT ORIGINAL LINE X AND Y: Never shift text to the left!
             if original_line_baselines and idx < len(original_line_baselines):
                 current_y = original_line_baselines[idx]
+                line_x0 = original_line_lefts[idx] if original_line_lefts and idx < len(original_line_lefts) else x0
             elif idx > 0:
                 current_y += self.line_height
+                line_x0 = original_line_lefts[-1] if original_line_lefts else x0
+            else:
+                line_x0 = original_line_lefts[0] if original_line_lefts else x0
 
-            indent = first_line_indent if is_first else 0.0
-            line_x0 = x0 + indent
+            indent = first_line_indent if (is_first and idx == 0) else hanging_indent
+            line_x0 += indent
             line_w = self.measure_text_width(line_str) if line_str else 0.0
             target_w = max(0.0, original_width - indent)
 
@@ -148,11 +144,7 @@ class TextReflowEngine:
         final_y1 = current_y + (self.font_size * 0.22)
         new_bbox = (x0, y0, x0 + max(original_width, max_line_width), final_y1)
 
-        # Only cascade downstream blocks if the number of lines actually changed
-        if original_line_baselines and len(final_lines) == len(original_line_baselines):
-            height_delta = 0.0
-        else:
-            height_delta = final_y1 - y1
+        height_delta = 0.0 if (original_line_baselines and len(final_lines) == len(original_line_baselines)) else (final_y1 - y1)
 
         return ReflowResult(
             lines=reflowed_lines,

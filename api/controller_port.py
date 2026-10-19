@@ -1,5 +1,3 @@
-"""HTTP API. Every request is tied to the caller's own Session (cookie `sid`): own document,
-undo stack, hidden-text list, font caches. Nothing is shared between users."""
 import os
 import copy
 import time
@@ -15,9 +13,9 @@ from services.sessions import Session
 from services.page_geometry import extract_page_geometry
 from services.spatial_cluster import SpatialClusterer, ParagraphBlock
 from services.obj_reflow import TextReflowEngine
-from services.compiler import PDFCompiler, draw_text_with_glyph_fallback
+from services.compiler import PDFCompiler, draw_text_with_glyph_fallback, compute_empirical_width_scale
 from services.erase_service import safe_erase
-from services.font_service import reset_cache
+from services.font_service import reset_cache, font_chain
 
 router = APIRouter()
 
@@ -27,7 +25,6 @@ MAX_UNDO = 15
 NO_DOC = "Please open your PDF first."
 
 
-# ----------------------------------------------------------------------------- helpers
 def need(request: Request) -> Session:
     s, _ = sessions.get(request.headers.get("cookie"), create=False)
     if s is None or s.doc is None:
@@ -60,7 +57,6 @@ def take_snapshot(s: Session):
 
 
 def restore_snapshot(s: Session):
-    """Pop the newest snapshot and make it the live document."""
     path, ghost = s.undo.pop()
     s.doc.close()
     d = fitz.open(path)
@@ -82,20 +78,17 @@ def find_target_block(blocks: List[ParagraphBlock], op: dict) -> Optional[Paragr
     op_bbox = op.get("bbox", [])
     old_text = op.get("old", "").strip()
 
-    # 1. explicit id, if its box still agrees with what the browser saw
     if isinstance(block_id, int) and 0 <= block_id < len(blocks):
         cand = blocks[block_id]
         if not op_bbox or max(abs(a - c) for a, c in zip(cand.bbox, op_bbox)) < 25.0:
             return cand
 
-    # 2. identical text (whitespace-normalised)
     norm_old = " ".join(old_text.split())
     if norm_old:
         for b in blocks:
             if " ".join(b.text.strip().split()) == norm_old:
                 return b
 
-    # 3. nearest by centre point
     if op_bbox and len(op_bbox) == 4:
         cx, cy = (op_bbox[0] + op_bbox[2]) / 2.0, (op_bbox[1] + op_bbox[3]) / 2.0
         dist = lambda b: ((b.bbox[0] + b.bbox[2]) / 2.0 - cx) ** 2 + ((b.bbox[1] + b.bbox[3]) / 2.0 - cy) ** 2
@@ -103,16 +96,14 @@ def find_target_block(blocks: List[ParagraphBlock], op: dict) -> Optional[Paragr
         if dist(best) < 10000:
             return best
 
-    # 4. substring
     if norm_old:
         for b in blocks:
             nb = " ".join(b.text.strip().split())
             if nb and (norm_old in nb or nb in norm_old):
                 return b
-    return None          # never guess: editing the wrong paragraph is worse than an error
+    return None
 
 
-# ----------------------------------------------------------------------------- /open
 def _open(s: Session, body: bytes, password: str) -> dict:
     with s.lock, sessions.HEAVY:
         path = os.path.join(s.dir, f"doc{time.time_ns()}.pdf")
@@ -134,7 +125,7 @@ def _open(s: Session, body: bytes, password: str) -> dict:
             doc.close()
             raise HTTPException(status_code=400, detail=f"Too many pages (limit {sessions.MAX_PAGES}).")
 
-        old = s.doc                       # only now that the new file is good, drop the old one
+        old = s.doc
         if old is not None:
             try:
                 old.close()
@@ -159,11 +150,10 @@ async def open_pdf(request: Request, password: str = ""):
         resp = JSONResponse({"error": e.detail, "detail": e.detail}, status_code=e.status_code)
     if is_new:
         resp.set_cookie("sid", s.id, httponly=True, samesite="strict", path="/",
-                        secure=os.environ.get("COOKIE_SECURE") == "1")   # set COOKIE_SECURE=1 behind HTTPS
+                        secure=os.environ.get("COOKIE_SECURE") == "1")
     return resp
 
 
-# ----------------------------------------------------------------------------- read
 @router.get("/pageimg/{page_idx}")
 def get_page_image(page_idx: int, request: Request):
     s = need(request)
@@ -188,19 +178,25 @@ def get_page_text(page_idx: int, request: Request):
         out = []
         for idx, p in enumerate(blocks):
             first = p.lines[0].tokens[0] if (p.lines and p.lines[0].tokens) else None
+            sz = p.lines[0].dominant_font_size if p.lines else 11.0
+            lh = p.measured_line_height if p.measured_line_height else (sz * 1.28)
             out.append({
                 "id": idx,
                 "text": p.text,
                 "bbox": list(p.bbox),
                 "dbox": list(fitz.Rect(p.bbox) * pg.rotation_matrix),
                 "font": first.font_name if first else "helv",
-                "size": p.lines[0].dominant_font_size if p.lines else 11.0,
+                "size": sz,
+                "line_height": lh,
                 "flags": first.flags if first else 0,
+                "color": first.color if first else 0,
+                "align": p.alignment,
+                "lines_count": len(p.lines),
+                "max_w": (p.container_max_x1 - p.bbox[0]) if p.container_max_x1 else (p.bbox[2] - p.bbox[0]),
             })
         return out
 
 
-# ----------------------------------------------------------------------------- /edit
 SERIF_ETC = {"sans": ("Helvetica", 0), "serif": ("Times", 4), "mono": ("Courier", 8)}
 
 
@@ -217,7 +213,7 @@ def _edit(s: Session, op: dict) -> dict:
         if not 0 <= page_num < len(doc):
             raise HTTPException(status_code=400, detail="Invalid page number")
         if op_type == "line" and op.get("old", "") == op.get("new", ""):
-            return {"unchanged": True, "missing": "", "note": ""}      # no undo step for a no-op
+            return {"unchanged": True, "missing": "", "note": ""}
 
         page = doc[page_num]
         take_snapshot(s)
@@ -232,25 +228,26 @@ def _edit(s: Session, op: dict) -> dict:
                     raise ValueError("Text not found on this page - reload the page and try again.")
 
                 first_baseline = target.lines[0].baseline_y if target.lines else target.bbox[1] + 10.0
-                if len(target.lines) == 1 and "\n" not in new_text:
+                size = target.lines[0].dominant_font_size if target.lines else 11.0
+                first_tok = target.lines[0].tokens[0] if (target.lines and target.lines[0].tokens) else None
+                fname = first_tok.font_name if first_tok else "helv"
+                fflags = first_tok.flags if first_tok else 0
+
+                chain = font_chain(doc, page, fname, fflags, cache=s.cache)
+                primary_font = chain[0][0] if chain else fitz.Font("helv")
+                w_scale = compute_empirical_width_scale(page, doc, target, s.cache)
+
+                def _measure(txt: str) -> float:
+                    return primary_font.text_length(txt, fontsize=size) * w_scale
+
+                max_single_w = (target.container_max_x1 - target.bbox[0]) if target.container_max_x1 else (target.bbox[2] - target.bbox[0])
+                if (len(target.lines) == 1
+                        and "\n" not in new_text
+                        and _measure(new_text) <= max(max_single_w, target.bbox[2] - target.bbox[0]) + 15.0):
                     reflow = TextReflowEngine.single_line(new_text, target.bbox, first_baseline)
                 else:
-                    from services.font_service import font_chain
-                    from services.compiler import compute_empirical_width_scale
-
-                    size = target.lines[0].dominant_font_size if target.lines else 11.0
-                    first_tok = target.lines[0].tokens[0] if (target.lines and target.lines[0].tokens) else None
-                    fname = first_tok.font_name if first_tok else "helv"
-                    fflags = first_tok.flags if first_tok else 0
-
-                    chain = font_chain(doc, page, fname, fflags, cache=s.cache)
-                    primary_font = chain[0][0] if chain else fitz.Font("helv")
-                    w_scale = compute_empirical_width_scale(page, doc, target, s.cache)
-
-                    def _measure(txt: str) -> float:
-                        return primary_font.text_length(txt, fontsize=size) * w_scale
-
                     orig_baselines = [ln.baseline_y for ln in target.lines]
+                    orig_lefts = [ln.bbox[0] for ln in target.lines]
                     reflow = TextReflowEngine(
                         font_name="helv",
                         font_size=size,
@@ -263,8 +260,10 @@ def _edit(s: Session, op: dict) -> dict:
                         page_width=float(page.rect.width),
                         container_max_x1=target.container_max_x1,
                         first_line_indent=target.first_line_indent,
+                        hanging_indent=target.hanging_indent,
                         alignment=target.alignment,
                         original_line_baselines=orig_baselines,
+                        original_line_lefts=orig_lefts,
                     )
 
                 report = PDFCompiler(doc, cache=s.cache).apply_edit_and_cascade(
@@ -284,7 +283,6 @@ def _edit(s: Session, op: dict) -> dict:
                 s.blocks.pop(page_num, None)
                 return {"missing": "", "note": ""}
 
-            # cover
             r = fitz.Rect(op["rect"]) * page.derotation_matrix
             r.normalize()
             if r.width >= 1 and r.height >= 1:
@@ -296,7 +294,7 @@ def _edit(s: Session, op: dict) -> dict:
             restore_snapshot(s)
             raise
         except Exception as e:
-            restore_snapshot(s)           # the failed edit leaves nothing behind, not even an undo step
+            restore_snapshot(s)
             raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -312,7 +310,6 @@ async def apply_edit(request: Request):
     return await run_in_threadpool(_edit, s, op)
 
 
-# ----------------------------------------------------------------------------- undo / save
 @router.post("/undo")
 def undo_pdf(request: Request):
     s = need(request)

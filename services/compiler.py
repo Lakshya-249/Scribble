@@ -4,7 +4,7 @@ from typing import List, Tuple, Optional
 
 from services.spatial_cluster import ParagraphBlock
 from services.obj_reflow import ReflowResult
-from services.erase_service import safe_erase
+from services.erase_service import safe_erase, erase_underline_rect
 from services.font_service import (
     font_chain,
     register_font_name,
@@ -66,9 +66,8 @@ def layout_run(page, doc, run: Run, cache, width_scale: float = 1.0) -> Tuple[Li
 
 
 def compute_empirical_width_scale(page, doc, block: ParagraphBlock, cache: dict) -> float:
-    """Compare the original PDF glyph advance widths in `block` against our font_chain's
-    measured widths. If the PDF used custom tracking or a slightly wider/narrower font metric,
-    return a calibration factor (clamped to [0.92, 1.12]) so the paragraph does not shrink."""
+    """Calibrates horizontal glyph advance widths against the original PDF tokens so edited
+    paragraphs never shrink horizontally."""
     pdf_w_total = 0.0
     calc_w_total = 0.0
     for ln in block.lines:
@@ -76,21 +75,22 @@ def compute_empirical_width_scale(page, doc, block: ParagraphBlock, cache: dict)
             if tok.char.isspace() or invisible(tok.char):
                 continue
             tw = tok.bbox[2] - tok.bbox[0]
-            if tw <= 0.1:
+            if tw <= 0.6:
                 continue
             chain = font_chain(doc, page, tok.font_name, tok.flags, cache=cache)
             ent = next((e for e in chain if e[0].has_glyph(ord(tok.char))), chain[0])
             cw = ent[0].text_length(tok.char, fontsize=tok.font_size)
-            if cw > 0.1:
+            if cw > 0.6:
                 pdf_w_total += tw
                 calc_w_total += cw
     if calc_w_total <= 1.0:
         return 1.0
     ratio = pdf_w_total / calc_w_total
-    return max(0.92, min(1.12, ratio))
+    return max(0.94, min(1.08, ratio))
 
 
-def draw_pieces(page, x, y, pieces, st: Style, fallback_code, cache, extra_space_w: float = 0.0) -> float:
+def draw_pieces(page, x, y, pieces, st: Style, fallback_code, cache, extra_space_w: float = 0.0,
+                original_underline_rects: Optional[List[tuple]] = None) -> float:
     color = rgb(st.color)
     start_x = x
     for pc in pieces:
@@ -109,12 +109,20 @@ def draw_pieces(page, x, y, pieces, st: Style, fallback_code, cache, extra_space
             x += extra_space_w
 
     if st.underline and x > start_x:
-        ul_y = y + st.size * 0.11
+        # Match exact original underline thickness and offset if available
         ul_thick = max(0.45, st.size * 0.055)
+        ul_offset = st.size * 0.11
+        if original_underline_rects:
+            # Take thickness and baseline offset from the first original underline rect
+            urect = original_underline_rects[0]
+            ul_thick = max(0.4, urect[3] - urect[1])
+            # urect[1] is top of underline rect
+            ul_offset = max(2.0, urect[1] - y)
+
+        ul_y = y + ul_offset
         page.draw_line(fitz.Point(start_x, ul_y), fitz.Point(x, ul_y), color=color, width=ul_thick)
 
     return x
-
 
 def draw_text_with_glyph_fallback(page, doc, origin, text, fname, flags, fontsize, color,
                                   cache: Optional[dict] = None):
@@ -140,7 +148,6 @@ class PDFCompiler:
         width_scale: float = 1.0,
         justify_target_w: float = 0.0,
     ):
-        """-> [x, y, [(run, pieces, fallback_code)], total_width, extra_space_w]"""
         planned, total = [], 0.0
         space_count = 0
         for r in runs:
@@ -156,7 +163,6 @@ class PDFCompiler:
         extra_space_w = 0.0
         if justify_target_w > total and space_count > 0:
             diff = justify_target_w - total
-            # Stretch spaces up to a reasonable typographic limit so justified lines stay flush-right
             if diff <= max(35.0, justify_target_w * 0.22):
                 extra_space_w = diff / space_count
                 total += diff
@@ -188,8 +194,7 @@ class PDFCompiler:
                 ox0, oy0, ox1, oy1 = b.bbox
                 ow = max(1.0, ox1 - ox0)
                 overlap_x = max(0.0, min(target_x1, ox1) - max(target_x0, ox0))
-                # Only cascade blocks in the SAME column (significant horizontal overlap)
-                if oy0 >= target_y1 - 1.0 and overlap_x >= 0.4 * min(target_w, ow):
+                if oy0 >= target_y1 - 1.0 and overlap_x >= 0.35 * min(target_w, ow):
                     downstream.append(b)
 
         # ---- 1. PLAN everything first (before redacting/erasing embedded fonts)
@@ -217,7 +222,6 @@ class PDFCompiler:
                 )
             )
 
-        # Numeric cell in a right-aligned column: keep the RIGHT edge where it was
         if (len(plan) == 1 and len(target_block.lines) == 1
                 and is_numeric_cell(new_text) and is_numeric_cell(target_block.text)
                 and looks_right_aligned(target_block, all_blocks)):
@@ -245,15 +249,16 @@ class PDFCompiler:
                     )
                 )
 
-        # ---- 2. Erase text and any vector underlines attached to target/downstream blocks
+        # ---- 2. Erase old text AND old vector underlines
+        # Erase old text AND all associated vector underlines
         safe_erase(page, target_block.bbox, fill_bg=False, ghost=ghost)
         for urect in getattr(target_block, "underline_rects", ()):
-            safe_erase(page, urect, fill_bg=True, ghost=None)
+            erase_underline_rect(page, urect)
 
         for db in downstream:
             safe_erase(page, db.bbox, fill_bg=False, ghost=ghost)
             for urect in getattr(db, "underline_rects", ()):
-                safe_erase(page, urect, fill_bg=True, ghost=None)
+                    erase_underline_rect(page, urect)
 
         # ---- 3. Draw planned runs and new underlines
         for x, y, planned, _, extra_space_w in plan:

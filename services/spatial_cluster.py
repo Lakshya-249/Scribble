@@ -2,6 +2,45 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
+BULLET_CHARS = set("\u2022\u2023\u25e6\u2043\u2219\u25cf\u25aa\u25ab\u25b8\u2013\u2014-*>\u00b7")
+
+
+def _starts_with_bullet(text: str) -> bool:
+    s = text.lstrip()
+    if not s:
+        return False
+    if s[0] in BULLET_CHARS:
+        return True
+    head = s.split(" ", 1)[0]
+    if 1 < len(head) <= 4 and head.rstrip(".)").lstrip("(").isalnum() and any(c in head for c in ".)"):
+        return True
+    return False
+
+
+def _detect_hanging_indent(line_text: str, tokens: list) -> float:
+    """If a line starts with a bullet ('• Text'), compute the X offset from the bullet's
+    left edge to the start of the first word after the bullet so wrapped lines align under 'Text'."""
+    if not tokens or not _starts_with_bullet(line_text):
+        return 0.0
+    x0 = tokens[0].bbox[0]
+    saw_bullet = False
+    saw_gap = False
+    for i, t in enumerate(tokens):
+        if not t.char.isspace() and not saw_bullet:
+            saw_bullet = True
+            continue
+        if saw_bullet:
+            if t.char.isspace():
+                saw_gap = True
+                continue
+            prev = tokens[i - 1]
+            if saw_gap or (t.bbox[0] - prev.bbox[2]) > prev.font_size * 0.12:
+                indent = t.bbox[0] - x0
+                if 4.0 <= indent <= 36.0:
+                    return float(indent)
+                break
+    return 0.0
+
 
 @dataclass
 class CharToken:
@@ -13,6 +52,7 @@ class CharToken:
     flags: int
     color: int = 0
     underline: bool = False
+    seq_id: int = 0
 
 
 @dataclass
@@ -27,13 +67,20 @@ class TextLine:
 
     def _word_gap_em(self) -> float:
         gaps = []
-        for a, b in zip(self.tokens, self.tokens[1:]):
-            if a.char.isalnum() and b.char.isalnum() and a.font_size > 0:
-                gaps.append((b.bbox[0] - a.bbox[2]) / a.font_size)
+        adv_x2 = None
+        for t in self.tokens:
+            if adv_x2 is not None and t.char.isalnum() and t.font_size > 0:
+                w = t.bbox[2] - t.bbox[0]
+                if w > 0.5:
+                    gaps.append((t.bbox[0] - adv_x2) / t.font_size)
+            if t.char.isalnum():
+                adv_x2 = max(adv_x2 or t.bbox[2], t.bbox[2])
+            else:
+                adv_x2 = None
         gaps.sort()
         base = gaps[int(len(gaps) * 0.3)] if len(gaps) >= 3 else 0.0
-        base = max(-0.2, min(0.3, base))
-        return max(0.04, base + 0.045)
+        base = max(-0.15, min(0.25, base))
+        return max(0.055, base + 0.05)
 
     def _drop_tracking_spaces(self):
         toks = self.tokens
@@ -51,7 +98,9 @@ class TextLine:
     def finalize(self):
         if not self.tokens:
             return
-        self.tokens.sort(key=lambda t: t.bbox[0])
+        # Sort by rounded origin X (1.5pt buckets) and then native stream seq_id!
+        # This prevents expanded ligatures ('fi', 'fl') with identical/overlapping X from scrambling into 'defni ing'
+        self.tokens.sort(key=lambda t: (round(t.origin[0] / 1.5), t.seq_id))
         self._drop_tracking_spaces()
 
         x0 = min(t.bbox[0] for t in self.tokens)
@@ -68,21 +117,36 @@ class TextLine:
         thr = self._word_gap_em()
         chars_out = []
         first_end = None
+        advancing_x2 = self.tokens[0].bbox[2]
+
         for i, t in enumerate(self.tokens):
             if i > 0:
                 prev_t = self.tokens[i - 1]
-                dx = t.bbox[0] - prev_t.bbox[2]
+                prev_w = prev_t.bbox[2] - prev_t.bbox[0]
+                # Guard against 0-width expanded ligature halves ('fi', 'fl') creating false word spaces
+                effective_prev_x2 = max(
+                    advancing_x2,
+                    prev_t.origin[0] + (prev_t.font_size * 0.25 if prev_w < 0.6 else prev_w),
+                )
+                dx = t.bbox[0] - effective_prev_x2
                 size = max(prev_t.font_size, 1.0)
-                if (dx > thr * size and not prev_t.char.isspace() and not t.char.isspace()
+                same_ligature_origin = abs(t.origin[0] - prev_t.origin[0]) < 0.8
+
+                if (not same_ligature_origin
+                        and dx > thr * size
+                        and not prev_t.char.isspace()
+                        and not t.char.isspace()
                         and abs(t.origin[1] - prev_t.origin[1]) < size * 0.5):
                     chars_out.append(" ")
                     if first_end is None:
-                        first_end = prev_t.bbox[2]
+                        first_end = effective_prev_x2
                 elif t.char.isspace() and first_end is None:
-                    first_end = prev_t.bbox[2]
+                    first_end = effective_prev_x2
             chars_out.append(t.char)
+            advancing_x2 = max(advancing_x2, t.bbox[2])
+
         if first_end is None:
-            first_end = self.tokens[-1].bbox[2]
+            first_end = advancing_x2
         self.first_word_w = max(0.0, first_end - self.tokens[0].bbox[0])
         self.text = "".join(chars_out)
 
@@ -93,8 +157,9 @@ class ParagraphBlock:
     bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     text: str = ""
     measured_line_height: Optional[float] = None
-    alignment: str = "left"             # "left", "right", "center", "justify"
+    alignment: str = "left"
     first_line_indent: float = 0.0
+    hanging_indent: float = 0.0
     container_max_x1: Optional[float] = None
     underline_rects: List[Tuple[float, float, float, float]] = field(default_factory=list)
 
@@ -112,7 +177,15 @@ class ParagraphBlock:
             y1 = max(y1, uy1 + 0.5)
         self.bbox = (x0, y0, x1, y1)
 
-        # 1. Measure true baseline-to-baseline leading from the original PDF lines
+        # 1. Detect hanging indent for bulleted/numbered items
+        if self.lines:
+            self.hanging_indent = _detect_hanging_indent(self.lines[0].text, self.lines[0].tokens)
+            if len(self.lines) >= 2 and self.hanging_indent == 0.0:
+                diff_indent = self.lines[1].bbox[0] - self.lines[0].bbox[0]
+                if 4.0 <= diff_indent <= 36.0 and _starts_with_bullet(self.lines[0].text):
+                    self.hanging_indent = float(diff_indent)
+
+        # 2. Measure true baseline-to-baseline leading
         if len(self.lines) >= 2:
             diffs = [
                 self.lines[i + 1].baseline_y - self.lines[i].baseline_y
@@ -122,7 +195,7 @@ class ParagraphBlock:
             if diffs:
                 self.measured_line_height = float(np.median(diffs))
 
-        # 2. Detect paragraph alignment & first-line indent
+        # 3. Detect paragraph alignment & first-line indent
         if len(self.lines) >= 2:
             non_last = self.lines[:-1]
             lefts = [ln.bbox[0] for ln in self.lines]
@@ -130,7 +203,9 @@ class ParagraphBlock:
             centers = [(ln.bbox[0] + ln.bbox[2]) * 0.5 for ln in self.lines]
 
             body_left = float(np.median(lefts[1:])) if len(lefts) > 1 else lefts[0]
-            if abs(lefts[0] - body_left) > 4.0 and all(abs(l - body_left) <= 2.0 for l in lefts[1:]):
+            if (self.hanging_indent == 0.0
+                    and abs(lefts[0] - body_left) > 4.0
+                    and all(abs(l - body_left) <= 2.0 for l in lefts[1:])):
                 self.first_line_indent = lefts[0] - body_left
 
             right_spread = max(rights) - min(rights) if rights else 999.0
@@ -146,11 +221,11 @@ class ParagraphBlock:
             else:
                 self.alignment = "left"
 
-        # 3. Soft wrap vs. hard line break reconstruction
+        # 4. Reconstruct soft-wrapped lines vs. explicit line breaks
         right = x1
         firsts = [ln.text.split(" ")[0] for ln in self.lines]
         top = max((firsts.count(w) for w in set(firsts)), default=0)
-        bullet = sum(1 for w in firsts if w[:1] in "\u2022-\u2013*\u25cf\u25aa>" or w.rstrip(".)").isdigit())
+        bullet = sum(1 for w in firsts if _starts_with_bullet(w))
         list_like = len(self.lines) >= 2 and (top >= max(2, 0.6 * len(self.lines)) or bullet >= 2)
         flowing = (not list_like and len(self.lines) >= 2
                    and (right - self.lines[-1].bbox[2]) > -2.0)
@@ -170,8 +245,6 @@ class ParagraphBlock:
 
 def _has_v_barrier(x_left: float, x_right: float, y_top: float, y_bot: float,
                    v_barriers: List[Tuple[float, float, float, float]]) -> bool:
-    """True if any vertical border/grid line sits horizontally between x_left and x_right
-    and overlaps vertically with [y_top, y_bot]."""
     if x_right < x_left:
         x_left, x_right = x_right, x_left
     for vx0, vy0, vx1, vy1 in v_barriers:
@@ -185,7 +258,6 @@ def _has_v_barrier(x_left: float, x_right: float, y_top: float, y_bot: float,
 
 def _has_h_barrier(y_top_line: float, y_bot_line: float, x_left: float, x_right: float,
                    h_barriers: List[Tuple[float, float, float, float]]) -> bool:
-    """True if any horizontal border/rule sits vertically between two lines and overlaps horizontally."""
     for hx0, hy0, hx1, hy1, *_ in h_barriers:
         hy_mid = (hy0 + hy1) * 0.5
         if (y_top_line - 1.5) <= hy_mid <= (y_bot_line + 1.5):
@@ -214,7 +286,8 @@ class SpatialClusterer:
         if not tokens:
             return []
 
-        tokens.sort(key=lambda t: (round(t.origin[1], 1), t.bbox[0]))
+        # Sort by rounded baseline Y, then rounded origin X, then native stream sequence ID
+        tokens.sort(key=lambda t: (round(t.origin[1] / 2.0), round(t.origin[0] / 1.5), t.seq_id))
         lines: List[TextLine] = []
 
         for token in tokens:
@@ -226,8 +299,6 @@ class SpatialClusterer:
                 if same_row:
                     last_tok = max(line.tokens, key=lambda t: t.bbox[2])
                     gap = token.bbox[0] - last_tok.bbox[2]
-                    # Tightened horizontal gap threshold so multi-column gutters (> 1.65em)
-                    # and borderless table columns are never glued into a single line
                     max_allowed_gap = line.dominant_font_size * self.max_char_h_gap_ratio
                     if -line.dominant_font_size <= gap <= max_allowed_gap:
                         y_min = min(token.bbox[1], last_tok.bbox[1])
@@ -255,7 +326,6 @@ class SpatialClusterer:
         lines: List[TextLine],
         h_segments: List[Tuple[float, float, float, float, int]],
     ) -> List[Tuple[float, float, float, float]]:
-        """Separates vector underlines from structural horizontal table/box borders."""
         structural_h_barriers: List[Tuple[float, float, float, float]] = []
 
         for seg in h_segments:
@@ -268,18 +338,16 @@ class SpatialClusterer:
                 lx0, ly0, lx1, ly1 = ln.bbox
                 line_w = max(1.0, lx1 - lx0)
                 size = ln.dominant_font_size
-                # An underline sits just below the baseline: [-0.05*size, +0.35*size]
                 dy = hy_mid - ln.baseline_y
                 if -0.05 * size <= dy <= 0.35 * size:
                     overlap_x = min(lx1, hx1) - max(lx0, hx0)
-                    # Must overlap text horizontally and not extend wildly past the line like a full-page rule
                     if overlap_x >= 3.0 and seg_w <= line_w + 18.0:
                         matched_as_underline = True
                         ln.underline_rects.append((hx0, hy0, hx1, hy1))
                         for tok in ln.tokens:
                             if not tok.char.isspace():
                                 tx_mid = (tok.bbox[0] + tok.bbox[2]) * 0.5
-                                if (hx0 - 1.5) <= tx_mid <= (hx1 + 1.5):
+                                if (hx0 - 1.0) <= tx_mid <= (hx1 + 1.0):
                                     tok.underline = True
                         break
 
@@ -293,105 +361,110 @@ class SpatialClusterer:
         return structural_h_barriers
 
     def cluster_lines_into_paragraphs(
-        self,
-        lines: List[TextLine],
-        h_barriers: List[Tuple[float, float, float, float]] = (),
-        v_barriers: List[Tuple[float, float, float, float]] = (),
-        page_width: float = 612.0,
-    ) -> List[ParagraphBlock]:
-        if not lines:
-            return []
+            self,
+            lines: List[TextLine],
+            h_barriers: List[Tuple[float, float, float, float]] = (),
+            v_barriers: List[Tuple[float, float, float, float]] = (),
+            page_width: float = 612.0,
+        ) -> List[ParagraphBlock]:
+            if not lines:
+                return []
 
-        # Sort primarily top-to-bottom; cluster by matching against active column paragraphs
-        lines.sort(key=lambda ln: (round(ln.baseline_y, 1), ln.bbox[0]))
-        paragraphs: List[ParagraphBlock] = []
+            lines.sort(key=lambda ln: (round(ln.baseline_y, 1), ln.bbox[0]))
+            paragraphs: List[ParagraphBlock] = []
 
-        for line in lines:
-            best_para: Optional[ParagraphBlock] = None
-            best_dy = 1e9
-
-            for cand in reversed(paragraphs):
-                prev_line = cand.lines[-1]
-                delta_y = line.baseline_y - prev_line.baseline_y
-                if delta_y <= 0.0:
+            for line in lines:
+                if _starts_with_bullet(line.text):
+                    paragraphs.append(ParagraphBlock(lines=[line]))
                     continue
 
-                median_size = (line.dominant_font_size + prev_line.dominant_font_size) / 2.0
-                max_lead = median_size * self.para_lead_ratio
-                if delta_y > max_lead:
-                    continue
+                best_para: Optional[ParagraphBlock] = None
+                best_dy = 1e9
 
-                # Check consistent leading if paragraph already has >= 2 lines
-                if len(cand.lines) >= 2:
-                    prev_dy = cand.lines[-1].baseline_y - cand.lines[-2].baseline_y
-                    if abs(delta_y - prev_dy) > max(3.5, median_size * 0.35):
+                for cand in reversed(paragraphs):
+                    prev_line = cand.lines[-1]
+                    delta_y = line.baseline_y - prev_line.baseline_y
+                    if delta_y <= 0.0:
                         continue
 
-                prev_x0, prev_y0, prev_x1, prev_y1 = prev_line.bbox
-                curr_x0, curr_y0, curr_x1, curr_y1 = line.bbox
-
-                # Left-edge or horizontal overlap check (respecting column boundaries)
-                overlap_x = max(0.0, min(prev_x1, curr_x1) - max(prev_x0, curr_x0))
-                left_diff = abs(curr_x0 - prev_x0)
-                has_spatial_continuity = (
-                    (overlap_x > 0.0 and left_diff <= median_size * 2.5)
-                    or left_diff <= median_size * 1.5
-                )
-                if not has_spatial_continuity:
-                    continue
-
-                font_size_continuity = abs(line.dominant_font_size - prev_line.dominant_font_size) <= 1.2
-                if not font_size_continuity:
-                    continue
-
-                # Never merge across a horizontal border or table grid line
-                x_span_0 = min(prev_x0, curr_x0)
-                x_span_1 = max(prev_x1, curr_x1)
-                if _has_h_barrier(prev_line.baseline_y, line.bbox[1], x_span_0, x_span_1, h_barriers):
-                    continue
-
-                # If the previous line was significantly shorter than earlier lines in the paragraph,
-                # it was the terminal line of that paragraph (do not merge the next paragraph into it)
-                para_max_x1 = max(l.bbox[2] for l in cand.lines)
-                para_min_x0 = min(l.bbox[0] for l in cand.lines)
-                para_w = para_max_x1 - para_min_x0
-                if len(cand.lines) >= 2 and para_w > 140.0:
-                    if (para_max_x1 - prev_x1) > max(45.0, para_w * 0.22):
+                    median_size = (line.dominant_font_size + prev_line.dominant_font_size) / 2.0
+                    max_lead = median_size * self.para_lead_ratio
+                    if delta_y > max_lead:
                         continue
 
-                if delta_y < best_dy:
-                    best_dy = delta_y
-                    best_para = cand
+                    # STRICT ISOLATION: Never merge a line into a paragraph if there is a font size
+                    # or style jump (e.g. merging a body word/name into a larger heading)
+                    if abs(line.dominant_font_size - prev_line.dominant_font_size) > 0.5:
+                        continue
 
-            if best_para is not None:
-                best_para.lines.append(line)
-            else:
-                paragraphs.append(ParagraphBlock(lines=[line]))
+                    # STRICT ISOLATION: If the previous line is short and looks like a header/title
+                    # (e.g. ends well before the right margin), never glue a trailing word/name to it.
+                    prev_w = prev_line.bbox[2] - prev_line.bbox[0]
+                    if prev_w < 350.0 and (prev_line.bbox[2] < page_width - 120.0):
+                        # Check if the current line sits to the right of the previous line (inline text)
+                        if line.bbox[0] > prev_line.bbox[2] + 4.0:
+                            continue
 
-        for para in paragraphs:
-            para.finalize()
+                    if len(cand.lines) >= 2:
+                        prev_dy = cand.lines[-1].baseline_y - cand.lines[-2].baseline_y
+                        if abs(delta_y - prev_dy) > max(3.5, median_size * 0.35):
+                            continue
 
-        # Compute column / cell right boundary (`container_max_x1`) for each paragraph
-        for p in paragraphs:
-            px0, py0, px1, py1 = p.bbox
-            limit_x1 = page_width - 36.0
-            # Check vertical barriers to the right of this block
-            for vx0, vy0, vx1, vy1 in v_barriers:
-                if vx0 >= px1 - 2.0 and min(py1, vy1) - max(py0, vy0) > 0:
-                    limit_x1 = min(limit_x1, vx0 - 3.0)
-            # Check other paragraphs sitting in a column to the right on the same vertical band
-            for other in paragraphs:
-                if other is p:
-                    continue
-                ox0, oy0, ox1, oy1 = other.bbox
-                if ox0 >= px1 + 4.0 and min(py1, oy1) - max(py0, oy0) > 0:
-                    limit_x1 = min(limit_x1, ox0 - 8.0)
-            p.container_max_x1 = max(px1, limit_x1)
+                    prev_x0, prev_y0, prev_x1, prev_y1 = prev_line.bbox
+                    curr_x0, curr_y0, curr_x1, curr_y1 = line.bbox
 
-        return paragraphs
+                    overlap_x = max(0.0, min(prev_x1, curr_x1) - max(prev_x0, curr_x0))
+                    left_diff = abs(curr_x0 - prev_x0)
+                    has_spatial_continuity = (
+                        (overlap_x > 0.0 and left_diff <= median_size * 2.5)
+                        or left_diff <= median_size * 1.8
+                    )
+                    if not has_spatial_continuity:
+                        continue
+
+                    x_span_0 = min(prev_x0, curr_x0)
+                    x_span_1 = max(prev_x1, curr_x1)
+                    if _has_h_barrier(prev_line.baseline_y, line.bbox[1], x_span_0, x_span_1, h_barriers):
+                        continue
+
+                    para_max_x1 = max(l.bbox[2] for l in cand.lines)
+                    para_min_x0 = min(l.bbox[0] for l in cand.lines)
+                    para_w = para_max_x1 - para_min_x0
+                    if len(cand.lines) >= 2 and para_w > 140.0:
+                        if (para_max_x1 - prev_x1) > max(45.0, para_w * 0.22):
+                            continue
+
+                    if delta_y < best_dy:
+                        best_dy = delta_y
+                        best_para = cand
+
+                if best_para is not None:
+                    best_para.lines.append(line)
+                else:
+                    paragraphs.append(ParagraphBlock(lines=[line]))
+
+            for para in paragraphs:
+                para.finalize()
+
+            for p in paragraphs:
+                px0, py0, px1, py1 = p.bbox
+                limit_x1 = page_width - 36.0
+                for vx0, vy0, vx1, vy1 in v_barriers:
+                    if vx0 >= px1 - 2.0 and min(py1, vy1) - max(py0, py0) > 0:
+                        limit_x1 = min(limit_x1, vx0 - 3.0)
+                for other in paragraphs:
+                    if other is p:
+                        continue
+                    ox0, oy0, ox1, oy1 = other.bbox
+                    if ox0 >= px1 + 4.0 and min(py1, oy1) - max(py0, oy0) > 0:
+                        limit_x1 = min(limit_x1, ox0 - 8.0)
+                p.container_max_x1 = max(px1, limit_x1)
+
+            return paragraphs
 
     def process(self, raw_page_geometry: Dict[str, Any]) -> List[ParagraphBlock]:
         tokens: List[CharToken] = []
+        seq = 0
         for block in raw_page_geometry.get("blocks", []):
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
@@ -408,8 +481,10 @@ class SpatialClusterer:
                                 font_size=f_size,
                                 flags=f_flags,
                                 color=int(span.get("color") or 0),
+                                seq_id=seq,
                             )
                         )
+                        seq += 1
 
         v_barriers = raw_page_geometry.get("v_barriers", [])
         h_segments = raw_page_geometry.get("h_segments", [])

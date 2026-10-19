@@ -59,10 +59,12 @@ def old_char_styles(block) -> List[Style]:
 
 
 def _dominant_style(styles: List[Style]) -> Style:
+    """Return the most frequent style in the block (ignoring bullet symbol at index 0)."""
     if not styles:
         return DEFAULT_STYLE
+    pool = styles[1:] if len(styles) > 2 else styles
     counts = {}
-    for st in styles:
+    for st in pool:
         counts[st] = counts.get(st, 0) + 1
     return max(counts.items(), key=lambda kv: kv[1])[0]
 
@@ -72,6 +74,8 @@ def new_char_styles(old_text: str, old_styles: List[Style], new_text: str) -> Li
     if not old_styles:
         return [DEFAULT_STYLE] * len(new_text)
     dominant = _dominant_style(old_styles)
+    has_any_underline = any(st.underline for st in old_styles)
+
     out: List[Style] = []
     sm = SequenceMatcher(None, old_text, new_text, autojunk=False)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -79,17 +83,19 @@ def new_char_styles(old_text: str, old_styles: List[Style], new_text: str) -> Li
             out.extend(old_styles[i1:i2])
         elif tag == "replace":
             for k in range(j2 - j1):
-                out.append(old_styles[min(i1 + k, i2 - 1)])
+                base_st = old_styles[min(i1 + k, i2 - 1)]
+                # If editing an underlined link, preserve underline on replacement text
+                if has_any_underline and not base_st.underline:
+                    base_st = Style(base_st.font, base_st.flags, base_st.size, base_st.color, True)
+                out.append(base_st)
         elif tag == "insert":
-            if i1 == 0 or i1 == len(old_text):
-                st = dominant
-            else:
-                st = old_styles[i1 - 1] if i1 > 0 else dominant
+            st = dominant
+            if has_any_underline and not st.underline:
+                st = Style(st.font, st.flags, st.size, st.color, True)
             out.extend([st] * (j2 - j1))
     if len(out) != len(new_text):
-        return [old_styles[0]] * len(new_text)
+        return [dominant] * len(new_text)
     return out
-
 
 def _group(text: str, styles: List[Style]) -> List[Run]:
     runs: List[Run] = []
