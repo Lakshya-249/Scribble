@@ -255,7 +255,7 @@ def _edit(s: Session, op: dict) -> dict:
                     reflow = TextReflowEngine.single_line(new_text, target.bbox, first_baseline)
                 else:
                     orig_baselines = [ln.baseline_y for ln in target.lines]
-                    orig_text_lefts = [ln.text_x0 for ln in target.lines]
+                    orig_text_lefts = [ln.bbox[0] for ln in target.lines]   # true left edge (bullet included)
                     reflow = TextReflowEngine(
                         font_name="helv",
                         font_size=size,

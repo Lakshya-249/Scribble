@@ -72,6 +72,10 @@ class TextReflowEngine:
         original_width = x1 - x0
 
         max_allowed_width = container_max_x1 - x0 if container_max_x1 else original_width
+        if original_line_baselines and len(original_line_baselines) >= 2:
+            # the paragraph was already wrapped by the PDF: keep ITS right edge instead of the wider
+            # container, otherwise edited lines run past the original margin
+            max_allowed_width = original_width
 
         paragraphs_or_lines = new_text.split("\n")
         final_lines: List[Tuple[str, bool, bool]] = []
@@ -104,19 +108,26 @@ class TextReflowEngine:
         current_y = initial_baseline_y
         max_line_width = 0.0
 
-        for idx, (line_str, is_last, is_first) in enumerate(final_lines):
-            # LOCK TO EXACT ORIGINAL TEXT X AND Y: Never shift text left into bullets!
-            if original_line_baselines and idx < len(original_line_baselines):
-                current_y = original_line_baselines[idx]
-                line_x0 = original_line_text_lefts[idx] if original_line_text_lefts and idx < len(original_line_text_lefts) else x0
-            elif idx > 0:
-                current_y += self.line_height
-                line_x0 = original_line_text_lefts[-1] if original_line_text_lefts else x0
-            else:
-                line_x0 = original_line_text_lefts[0] if original_line_text_lefts else x0
+        n_orig = len(original_line_baselines) if original_line_baselines else 0
+        lefts = original_line_text_lefts or []
+        left0 = lefts[0] if lefts else x0
+        # where a soft-wrapped continuation line starts: the original body column if the paragraph
+        # had one, else under the text after the bullet / first-line indent
+        cont_left = lefts[1] if len(lefts) > 1 else left0 + hanging_indent - first_line_indent
 
-            indent = first_line_indent if (is_first and idx == 0) else hanging_indent
-            line_x0 += indent
+        for idx, (line_str, is_last, is_first) in enumerate(final_lines):
+            # original_line_text_lefts are the REAL left edges of the old lines (a bullet line starts at
+            # its bullet, and the bullet is part of the text we redraw), so no extra indent is added there.
+            if idx < n_orig:
+                current_y = original_line_baselines[idx]
+                line_x0 = lefts[idx] if idx < len(lefts) else x0
+            else:
+                if idx > 0:
+                    current_y += self.line_height
+                # a line that follows an explicit line break (Enter) starts like the first line (own bullet,
+                # same left edge); only a soft-wrapped continuation is indented.
+                line_x0 = left0 if is_first else cont_left
+            indent = 0.0
             line_w = self.measure_text_width(line_str) if line_str else 0.0
             target_w = max(0.0, original_width - indent)
 

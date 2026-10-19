@@ -228,7 +228,8 @@ class ParagraphBlock:
             left_spread = max(lefts[1:]) - min(lefts[1:]) if len(lefts) > 1 else 0.0
             center_spread = max(centers) - min(centers)
 
-            if right_spread <= 3.0 and left_spread <= 3.0 and (x1 - x0) > 120.0:
+            # one non-last line always has right_spread == 0, so 2-line paragraphs were all called 'justify'
+            if len(rights) >= 2 and right_spread <= 3.0 and left_spread <= 3.0 and (x1 - x0) > 120.0:
                 self.alignment = "justify"
             elif center_spread <= 3.0 and left_spread > 4.0:
                 self.alignment = "center"

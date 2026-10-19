@@ -116,6 +116,12 @@ def plan_diff(block, new_text: str, measure: Callable[[int, int], float], limit_
     if not codes:
         return plan
 
+    # A line break was typed or removed. The diff path only draws glyphs on the existing line
+    # positions, so a "\n" would be silently dropped and the new text would land on the same line.
+    # Let the reflow engine (compiler fallback) lay out the new line structure instead.
+    if any("\n" in new_text[j1:j2] or "\n" in old[i1:i2] for _, i1, i2, j1, j2 in codes):
+        return _fail("line-break-changed")
+
     def real_before(i, line):
         k = i - 1
         while k >= 0 and cl[k] == line:

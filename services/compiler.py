@@ -1,10 +1,11 @@
+import dataclasses
 import re
 import pymupdf as fitz
 from typing import List, Tuple, Optional
 
-from services.spatial_cluster import ParagraphBlock
+from services.spatial_cluster import ParagraphBlock, BULLET_CHARS
 from services.obj_reflow import ReflowResult
-from services.erase_service import safe_erase, erase_underline_rect
+from services.erase_service import safe_erase, erase_underline_rect, remove_underline, draw_underline
 from services.font_service import (
     font_chain,
     register_font_name,
@@ -14,7 +15,7 @@ from services.font_service import (
     _DEFAULT_CACHE,
 )
 from services.style_runs import (
-    Style, Run, DEFAULT_STYLE, old_char_styles, new_char_styles, line_runs,
+    Style, Run, DEFAULT_STYLE, old_char_styles, new_char_styles, line_runs, style_of,
 )
 
 NUMERIC_CELL = re.compile(r"^[\s(+\-\u2212]*(?:[^\w\s(+\-\u2212]{1,3}\s*)?\d[\d,.\s]*\)?\s*%?\s*(?:Cr|Dr|CR|DR)?$")
@@ -34,6 +35,28 @@ def looks_right_aligned(block: ParagraphBlock, others: List[ParagraphBlock], tol
         if abs(ox1 - x1) <= tol and abs(ox0 - x0) > tol:
             return True
     return False
+
+
+def _bullet_cols(block: ParagraphBlock):
+    """(bullet_x, text_x): ABSOLUTE x of the bullet glyph and of the first real letter after it, taken from
+    the original glyphs (None if the block has no bullet). Invisible / zero-width glyphs between the two
+    are ignored."""
+    toks = [t for ln in block.lines for t in ln.tokens if not t.char.isspace() and not invisible(t.char)]
+    bullets = [t for t in toks if t.char in BULLET_CHARS]
+    if not bullets:
+        return None
+    bullet = min(bullets, key=lambda t: t.bbox[0])
+    if bullet.bbox[0] > min(t.bbox[0] for t in toks) + 1.0:
+        return None                                 # something sits left of the bullet: not a list marker
+    size = max(float(bullet.font_size), 1.0)
+    body = [t for t in toks
+            if t.char not in BULLET_CHARS
+            and t.bbox[0] >= bullet.bbox[2] - 0.5
+            and (t.bbox[2] - t.bbox[0]) > 0.3
+            and abs(t.origin[1] - bullet.origin[1]) < size * 0.8]
+    if not body:
+        return None
+    return float(bullet.origin[0]), float(min(t.origin[0] for t in body))
 
 
 class Piece:
@@ -207,19 +230,40 @@ class PDFCompiler:
         plan = []
         cursor = 0
         is_justified = getattr(target_block, "alignment", "left") == "justify"
+
+        # The old bullet->text gap (wide in many PDFs). Re-typesetting "● text" with one space would collapse it.
+        cols = _bullet_cols(target_block) if getattr(target_block, "alignment", "left") == "left" else None
+        print(f"[edit] bullet columns (bullet_x, text_x) = {cols}", flush=True)
+
         for line in reflow_res.lines:
             runs, cursor = line_runs(line.text, new_text, new_styles, cursor, default)
             just_w = line.target_width if (is_justified and not line.is_last_in_para) else 0.0
+            lx, ly = line.baseline_origin
+            if cols and line.text[:1] in BULLET_CHARS and runs and len(runs[0].text) >= 1:
+                # bullet and text go to the ORIGINAL columns (taken from the old glyphs), bullet never underlined
+                first = runs[0]
+                bst = dataclasses.replace(first.style, underline=False)
+                bullet_run = Run(first.text[0], bst)
+                rest = [Run(first.text[1:], first.style)] + list(runs[1:])
+                # drop every leading blank (it may sit in a later run when the bullet is styled differently)
+                while rest:
+                    t = rest[0].text
+                    k = 0
+                    # blanks AND zero-width glyphs (U+200B after the bullet is common): str.lstrip() keeps
+                    # U+200B, which hid the real space behind it and pushed the text right by one space
+                    while k < len(t) and (t[k].isspace() or invisible(t[k])):
+                        k += 1
+                    if k < len(t):
+                        rest[0] = Run(t[k:], rest[0].style)
+                        break
+                    rest.pop(0)
+                plan.append(self._plan_line(page, cols[0], ly, [bullet_run], report, width_scale=width_scale))
+                plan.append(self._plan_line(page, cols[1], ly, rest, report,
+                                            width_scale=width_scale, justify_target_w=just_w))
+                continue
             plan.append(
-                self._plan_line(
-                    page,
-                    line.baseline_origin[0],
-                    line.baseline_origin[1],
-                    runs,
-                    report,
-                    width_scale=width_scale,
-                    justify_target_w=just_w,
-                )
+                self._plan_line(page, lx, ly, runs, report,
+                                width_scale=width_scale, justify_target_w=just_w)
             )
 
         if (len(plan) == 1 and len(target_block.lines) == 1
@@ -227,43 +271,60 @@ class PDFCompiler:
                 and looks_right_aligned(target_block, all_blocks)):
             plan[0][0] = target_x1 - plan[0][3]
 
-        for db in downstream:
-            ds = old_char_styles(db)
-            dcur = 0
-            db_scale = compute_empirical_width_scale(page, self.doc, db, self.cache)
-            db_just = getattr(db, "alignment", "left") == "justify"
-            for idx_l, line in enumerate(db.lines):
-                runs, dcur = line_runs(line.text, db.text, ds, dcur, ds[0] if ds else DEFAULT_STYLE)
-                orig_x = line.tokens[0].origin[0] if line.tokens else db.bbox[0]
-                is_last_l = (idx_l == len(db.lines) - 1)
-                just_w = (db.bbox[2] - orig_x) if (db_just and not is_last_l) else 0.0
-                plan.append(
-                    self._plan_line(
-                        page,
-                        orig_x,
-                        line.baseline_y + height_delta,
-                        runs,
-                        report,
-                        width_scale=db_scale,
-                        justify_target_w=just_w,
-                    )
-                )
-
         # ---- 2. Erase old text AND old vector underlines
         # Erase old text AND all associated vector underlines
         safe_erase(page, target_block.bbox, fill_bg=False, ghost=ghost)
         for urect in getattr(target_block, "underline_rects", ()):
             erase_underline_rect(page, urect)
 
+        # Blocks below are MOVED, not re-typeset: every glyph keeps its own x, spacing, font and underline
+        # (re-typesetting collapsed bullet gaps and stretched underlines).
+        moved_links = []
+        if downstream:
+            for lk in page.get_links():
+                c = fitz.Rect(lk["from"])
+                cx, cy = (c.x0 + c.x1) / 2.0, (c.y0 + c.y1) / 2.0
+                if any(b.bbox[0] - 1 <= cx <= b.bbox[2] + 1 and b.bbox[1] - 1 <= cy <= b.bbox[3] + 1 for b in downstream):
+                    moved_links.append(lk)
         for db in downstream:
             safe_erase(page, db.bbox, fill_bg=False, ghost=ghost)
-            for urect in getattr(db, "underline_rects", ()):
-                    erase_underline_rect(page, urect)
+            for ln in db.lines:
+                for urect in getattr(ln, "underline_rects", ()):
+                    remove_underline(page, urect)
+                    erase_underline_rect(page, urect)   # also wipes anti-aliased remnants of the old line
+
+        # target block's own underlines (its text is re-typeset, so they are redrawn below)
+        for urect in getattr(target_block, "underline_rects", ()):
+            erase_underline_rect(page, urect)
 
         # ---- 3. Draw planned runs and new underlines
         for x, y, planned, _, extra_space_w in plan:
             for run, pieces, fb in planned:
                 x = draw_pieces(page, x, y, pieces, run.style, fb, self.cache, extra_space_w=extra_space_w)
+
+        dy = height_delta
+        for db in downstream:
+            for ln in db.lines:
+                items = []          # [x, y, text, style]; ligature halves ('f'+'l') share an origin: keep them together
+                for tok in ln.tokens:
+                    if tok.char.isspace() or invisible(tok.char):
+                        continue
+                    st = dataclasses.replace(style_of(tok), underline=False)
+                    if (items and abs(tok.origin[0] - items[-1][0]) < 0.8 and abs(tok.origin[1] - items[-1][1]) < 0.5
+                            and items[-1][3] == st):
+                        items[-1][2] += tok.char
+                    else:
+                        items.append([tok.origin[0], tok.origin[1], tok.char, st])
+                for ox, oy, txt, st in items:
+                    pieces, fb = layout_run(page, self.doc, Run(txt, st), self.cache, width_scale=1.0)
+                    draw_pieces(page, ox, oy + dy, pieces, st, fb, self.cache)
+                cols = list(getattr(ln, "underline_colors", []))
+                for k, (ux0, uy0, ux1, uy1) in enumerate(getattr(ln, "underline_rects", ())):
+                    draw_underline(page, (ux0, uy0 + dy, ux1, uy1 + dy), rgb(cols[k] if k < len(cols) else 0))
+        for lk in moved_links:
+            r = fitz.Rect(lk["from"])
+            lk["from"] = fitz.Rect(r.x0, r.y0 + dy, r.x1, r.y1 + dy)
+            page.update_link(lk)
 
         report["substituted"] = "".join(sorted(report["substituted"]))
         return report
