@@ -149,3 +149,9 @@ def safe_erase(page: fitz.Page, rect: fitz.Rect, fill_bg: bool = False, images: 
         ghost.extend([c, x, y] for c, x, y, bb in fresh
                      if r.contains(fitz.Point((bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2)))
     return "clipped"
+
+def erase_underline_rect(page: fitz.Page, rect: fitz.Rect):
+    """Erases a thin vector underline rectangle cleanly without shifting any text."""
+    r = fitz.Rect(rect) + (-0.5, -0.5, 0.5, 0.5)
+    bg = sample_bg(page, r, pad=1.5)
+    page.draw_rect(r, color=None, fill=bg, overlay=True)

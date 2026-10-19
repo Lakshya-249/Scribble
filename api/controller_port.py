@@ -235,10 +235,37 @@ def _edit(s: Session, op: dict) -> dict:
                 if len(target.lines) == 1 and "\n" not in new_text:
                     reflow = TextReflowEngine.single_line(new_text, target.bbox, first_baseline)
                 else:
+                    from services.font_service import font_chain
+                    from services.compiler import compute_empirical_width_scale
+
                     size = target.lines[0].dominant_font_size if target.lines else 11.0
-                    reflow = TextReflowEngine(font_name="helv", font_size=size).reflow_paragraph(
-                        new_text=new_text, original_bbox=target.bbox,
-                        initial_baseline_y=first_baseline, page_width=float(page.rect.width))
+                    first_tok = target.lines[0].tokens[0] if (target.lines and target.lines[0].tokens) else None
+                    fname = first_tok.font_name if first_tok else "helv"
+                    fflags = first_tok.flags if first_tok else 0
+
+                    chain = font_chain(doc, page, fname, fflags, cache=s.cache)
+                    primary_font = chain[0][0] if chain else fitz.Font("helv")
+                    w_scale = compute_empirical_width_scale(page, doc, target, s.cache)
+
+                    def _measure(txt: str) -> float:
+                        return primary_font.text_length(txt, fontsize=size) * w_scale
+
+                    orig_baselines = [ln.baseline_y for ln in target.lines]
+                    reflow = TextReflowEngine(
+                        font_name="helv",
+                        font_size=size,
+                        line_height=target.measured_line_height,
+                        measure_fn=_measure,
+                    ).reflow_paragraph(
+                        new_text=new_text,
+                        original_bbox=target.bbox,
+                        initial_baseline_y=first_baseline,
+                        page_width=float(page.rect.width),
+                        container_max_x1=target.container_max_x1,
+                        first_line_indent=target.first_line_indent,
+                        alignment=target.alignment,
+                        original_line_baselines=orig_baselines,
+                    )
 
                 report = PDFCompiler(doc, cache=s.cache).apply_edit_and_cascade(
                     page_num=page_num, target_block=target, reflow_res=reflow,

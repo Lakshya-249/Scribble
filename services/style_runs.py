@@ -1,13 +1,3 @@
-"""Per-character style tracking, so an edit keeps the look of the text around it.
-
-The old code drew a whole block in the font/size/colour of its FIRST character. A payslip
-cell, a "Label: value" line or a bold word inside a sentence therefore changed look as soon
-as it was edited. Here every character of the original text remembers its own style; the
-old and new text are diffed, characters that survive keep their style, and a typed
-replacement inherits the style of the character it replaced.
-
-Pure Python (no PyMuPDF), so it is easy to unit-test.
-"""
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import List, Tuple
@@ -19,6 +9,7 @@ class Style:
     flags: int
     size: float
     color: int = 0
+    underline: bool = False
 
 
 @dataclass
@@ -27,21 +18,21 @@ class Run:
     style: Style
 
 
-DEFAULT_STYLE = Style("helv", 0, 11.0, 0)
+DEFAULT_STYLE = Style("helv", 0, 11.0, 0, False)
 
 
 def style_of(tok) -> Style:
-    return Style(tok.font_name, int(tok.flags), round(float(tok.font_size), 2), int(tok.color or 0))
+    return Style(
+        tok.font_name,
+        int(tok.flags),
+        round(float(tok.font_size), 3),
+        int(tok.color or 0),
+        bool(getattr(tok, "underline", False)),
+    )
 
 
 def old_char_styles(block) -> List[Style]:
-    """One Style per character of block.text.
-
-    block.text was built from the tokens plus separators the extractor invented (word
-    spaces, line breaks). Walk both in parallel: a matching character takes its token's
-    style, an invented separator takes the style of the character before it.
-    Whitespace tokens in PDFs often carry stray body-font sizes/colours, so only visible
-    (non-whitespace) tokens are allowed to update `last`."""
+    """One Style per character of block.text."""
     flat = [t for ln in block.lines for t in ln.tokens if not t.char.isspace()]
     if not flat:
         all_toks = [t for ln in block.lines for t in ln.tokens]
@@ -57,7 +48,6 @@ def old_char_styles(block) -> List[Style]:
             last = style_of(flat[j])
             j += 1
         else:
-            # a token was dropped or desynced: resync a few tokens ahead
             for k in range(j + 1, min(j + 12, len(flat))):
                 if flat[k].char == ch:
                     j = k
@@ -69,7 +59,6 @@ def old_char_styles(block) -> List[Style]:
 
 
 def _dominant_style(styles: List[Style]) -> Style:
-    """Return the most frequent style in the block so boundary insertions match the heading."""
     if not styles:
         return DEFAULT_STYLE
     counts = {}
@@ -92,15 +81,12 @@ def new_char_styles(old_text: str, old_styles: List[Style], new_text: str) -> Li
             for k in range(j2 - j1):
                 out.append(old_styles[min(i1 + k, i2 - 1)])
         elif tag == "insert":
-            # Use dominant block style for insertions at the start/end,
-            # and local neighbor style for insertions in the middle.
             if i1 == 0 or i1 == len(old_text):
                 st = dominant
             else:
                 st = old_styles[i1 - 1] if i1 > 0 else dominant
             out.extend([st] * (j2 - j1))
-        # "delete": nothing to add
-    if len(out) != len(new_text):                 # cannot happen; stay safe anyway
+    if len(out) != len(new_text):
         return [old_styles[0]] * len(new_text)
     return out
 

@@ -1,7 +1,75 @@
 import pymupdf as fitz
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, Union, List, Tuple
 
 from services.erase_service import unghost
+
+
+def _extract_vector_primitives(
+    page: fitz.Page,
+) -> Tuple[List[Tuple[float, float, float, float, int]], List[Tuple[float, float, float, float]], List[Dict[str, Any]]]:
+    """
+    Extracts vector lines and rectangles from the PDF page and separates them into:
+      - h_segments: (x0, y0, x1, y1, color_int) horizontal rules / underlines / table row borders
+      - v_barriers: (x0, y0, x1, y1) vertical column dividers / table cell borders
+      - boxes:      [{"bbox": (x0, y0, x1, y1)}] rectangular containers
+    """
+    h_segments: List[Tuple[float, float, float, float, int]] = []
+    v_barriers: List[Tuple[float, float, float, float]] = []
+    boxes: List[Dict[str, Any]] = []
+
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return h_segments, v_barriers, boxes
+
+    for d in drawings:
+        rect = d.get("rect")
+        if rect is None:
+            continue
+        rx0, ry0, rx1, ry1 = float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)
+        w = rx1 - rx0
+        h = ry1 - ry0
+        color = d.get("color") or d.get("fill") or (0, 0, 0)
+        if isinstance(color, (list, tuple)) and len(color) >= 3:
+            c_int = (round(color[0] * 255) << 16) | (round(color[1] * 255) << 8) | round(color[2] * 255)
+        else:
+            c_int = 0
+
+        if w >= 4.0 and h <= 3.5:
+            h_segments.append((rx0, ry0, rx1, ry1, c_int))
+            continue
+
+        if h >= 6.0 and w <= 3.5:
+            v_barriers.append((rx0, ry0, rx1, ry1))
+            continue
+
+        for item in d.get("items", []):
+            kind = item[0]
+            if kind == "l":
+                p1, p2 = item[1], item[2]
+                x0, y0 = min(p1.x, p2.x), min(p1.y, p2.y)
+                x1, y1 = max(p1.x, p2.x), max(p1.y, p2.y)
+                lw = float(d.get("width") or 1.0)
+                if abs(p1.y - p2.y) <= 1.5 and (x1 - x0) >= 4.0:
+                    h_segments.append((x0, y0 - lw * 0.5, x1, y1 + lw * 0.5, c_int))
+                elif abs(p1.x - p2.x) <= 1.5 and (y1 - y0) >= 6.0:
+                    v_barriers.append((x0 - lw * 0.5, y0, x1 + lw * 0.5, y1))
+            elif kind == "re":
+                r = item[1]
+                bx0, by0, bx1, by1 = float(r.x0), float(r.y0), float(r.x1), float(r.y1)
+                bw, bh = bx1 - bx0, by1 - by0
+                if bw >= 4.0 and bh <= 3.5:
+                    h_segments.append((bx0, by0, bx1, by1, c_int))
+                elif bh >= 6.0 and bw <= 3.5:
+                    v_barriers.append((bx0, by0, bx1, by1))
+                elif bw >= 12.0 and bh >= 8.0:
+                    boxes.append({"bbox": (bx0, by0, bx1, by1)})
+                    h_segments.append((bx0, by0 - 0.5, bx1, by0 + 0.5, c_int))
+                    h_segments.append((bx0, by1 - 0.5, bx1, by1 + 0.5, c_int))
+                    v_barriers.append((bx0 - 0.5, by0, bx0 + 0.5, by1))
+                    v_barriers.append((bx1 - 0.5, by0, bx1 + 0.5, by1))
+
+    return h_segments, v_barriers, boxes
 
 
 def extract_page_geometry(
@@ -17,7 +85,10 @@ def extract_page_geometry(
     page = doc.load_page(page_number)
     page_width = float(page.rect.width)
     page_height = float(page.rect.height)
+    # Explicitly disable ligature splitting anomalies by reading rawdict cleanly
     page_data = page.get_text("rawdict")
+
+    h_segments, v_barriers, boxes = _extract_vector_primitives(page)
 
     extracted_blocks = []
     for block in page_data.get("blocks", []):
@@ -61,6 +132,9 @@ def extract_page_geometry(
         "page_width": page_width,
         "page_height": page_height,
         "blocks": extracted_blocks,
+        "h_segments": h_segments,
+        "v_barriers": v_barriers,
+        "boxes": boxes,
     }
 
 
