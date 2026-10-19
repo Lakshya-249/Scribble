@@ -66,7 +66,7 @@ class TextReflowEngine:
         hanging_indent: float = 0.0,
         alignment: str = "left",
         original_line_baselines: Optional[List[float]] = None,
-        original_line_lefts: Optional[List[float]] = None,
+        original_line_text_lefts: Optional[List[float]] = None,
     ) -> ReflowResult:
         x0, y0, x1, y1 = original_bbox
         original_width = x1 - x0
@@ -105,15 +105,15 @@ class TextReflowEngine:
         max_line_width = 0.0
 
         for idx, (line_str, is_last, is_first) in enumerate(final_lines):
-            # LOCK TO EXACT ORIGINAL LINE X AND Y: Never shift text to the left!
+            # LOCK TO EXACT ORIGINAL TEXT X AND Y: Never shift text left into bullets!
             if original_line_baselines and idx < len(original_line_baselines):
                 current_y = original_line_baselines[idx]
-                line_x0 = original_line_lefts[idx] if original_line_lefts and idx < len(original_line_lefts) else x0
+                line_x0 = original_line_text_lefts[idx] if original_line_text_lefts and idx < len(original_line_text_lefts) else x0
             elif idx > 0:
                 current_y += self.line_height
-                line_x0 = original_line_lefts[-1] if original_line_lefts else x0
+                line_x0 = original_line_text_lefts[-1] if original_line_text_lefts else x0
             else:
-                line_x0 = original_line_lefts[0] if original_line_lefts else x0
+                line_x0 = original_line_text_lefts[0] if original_line_text_lefts else x0
 
             indent = first_line_indent if (is_first and idx == 0) else hanging_indent
             line_x0 += indent

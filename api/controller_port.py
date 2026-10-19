@@ -247,7 +247,7 @@ def _edit(s: Session, op: dict) -> dict:
                     reflow = TextReflowEngine.single_line(new_text, target.bbox, first_baseline)
                 else:
                     orig_baselines = [ln.baseline_y for ln in target.lines]
-                    orig_lefts = [ln.bbox[0] for ln in target.lines]
+                    orig_text_lefts = [ln.text_x0 for ln in target.lines]
                     reflow = TextReflowEngine(
                         font_name="helv",
                         font_size=size,
@@ -263,7 +263,7 @@ def _edit(s: Session, op: dict) -> dict:
                         hanging_indent=target.hanging_indent,
                         alignment=target.alignment,
                         original_line_baselines=orig_baselines,
-                        original_line_lefts=orig_lefts,
+                        original_line_text_lefts=orig_text_lefts,
                     )
 
                 report = PDFCompiler(doc, cache=s.cache).apply_edit_and_cascade(

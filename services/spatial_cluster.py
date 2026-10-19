@@ -63,6 +63,7 @@ class TextLine:
     dominant_font_size: float = 0.0
     text: str = ""
     first_word_w: float = 0.0
+    text_x0: float = 0.0  # True starting X of text (excluding bullet symbol)
     underline_rects: List[Tuple[float, float, float, float]] = field(default_factory=list)
 
     def _word_gap_em(self) -> float:
@@ -109,10 +110,17 @@ class TextLine:
         y1 = max(t.bbox[3] for t in self.tokens)
         for ux0, uy0, ux1, uy1 in self.underline_rects:
             y1 = max(y1, uy1 + 0.5)
+#         self.bbox = (x0, y0, x1, y1)
+#
+#         self.baseline_y = float(np.median([t.origin[1] for t in self.tokens]))
+#         self.dominant_font_size = float(np.median([t.font_size for t in self.tokens]))
         self.bbox = (x0, y0, x1, y1)
-
         self.baseline_y = float(np.median([t.origin[1] for t in self.tokens]))
         self.dominant_font_size = float(np.median([t.font_size for t in self.tokens]))
+
+        # Find true text start X (skip leading bullet/marker tokens)
+        first_text_tok = next((t for t in self.tokens if not t.char.isspace() and t.char not in BULLET_CHARS), self.tokens[0])
+        self.text_x0 = float(first_text_tok.bbox[0])
 
         thr = self._word_gap_em()
         chars_out = []
