@@ -193,3 +193,117 @@ def draw_underline(page: fitz.Page, rect, rgb_colour) -> None:
         page.draw_line(fitz.Point(x0, ym), fitz.Point(x1, ym), color=rgb_colour, width=0.5)
     else:
         page.draw_rect(fitz.Rect(rect), color=None, fill=rgb_colour, overlay=True)
+
+
+def collect_drawings_below(page: fitz.Page, y_top: float, x0: float, x1: float) -> list:
+    """Vector paths (table borders, cell shading, rules, underlines) that sit below `y_top` and whose
+    centre is inside [x0, x1]: they must follow the text when an edit makes the paragraph above grow."""
+    out = []
+    pr = page.rect
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return out
+    for d in drawings:
+        r = d.get("rect")
+        if r is None or d.get("type") not in ("f", "s", "fs"):
+            continue                                    # clip paths etc. cannot be moved safely
+        if r.y0 < y_top:
+            continue
+        if r.height > 0.8 * pr.height and r.width > 0.8 * pr.width:
+            continue                                    # page background
+        if not (x0 - 2.0 <= (r.x0 + r.x1) / 2.0 <= x1 + 2.0):
+            continue
+        out.append(d)
+    return out
+
+
+def remove_drawings(page: fitz.Page, drawings: list) -> bool:
+    """Delete these vector paths (and only vector paths: text and images are untouched, nothing is painted)."""
+    if not drawings:
+        return True
+    try:
+        for d in drawings:
+            r = fitz.Rect(d["rect"])
+            pad = max(0.5, float(d.get("width") or 0.0) / 2.0 + 0.25)
+            page.add_redact_annot(r + (-pad, -pad, pad, pad), fill=False)
+        page.apply_redactions(images=0, graphics=1, text=fitz.PDF_REDACT_TEXT_NONE)
+        return True
+    except (TypeError, AttributeError, ValueError):
+        for a in list(page.annots(types=[fitz.PDF_ANNOT_REDACT]) or []):
+            page.delete_annot(a)
+        return False
+
+
+def redraw_drawings(page: fitz.Page, drawings: list, dy: float) -> int:
+    """Draw the same paths again, `dy` lower, with their own colour, width, dashes, fill and opacity."""
+    n = 0
+    for d in drawings:
+        try:
+            sh = page.new_shape()
+            for it in d["items"]:
+                k = it[0]
+                if k == "l":
+                    sh.draw_line(fitz.Point(it[1].x, it[1].y + dy), fitz.Point(it[2].x, it[2].y + dy))
+                elif k == "re":
+                    r = it[1]
+                    sh.draw_rect(fitz.Rect(r.x0, r.y0 + dy, r.x1, r.y1 + dy))
+                elif k == "qu":
+                    q = it[1]
+                    sh.draw_quad(fitz.Quad(*[fitz.Point(p.x, p.y + dy) for p in (q.ul, q.ur, q.ll, q.lr)]))
+                elif k == "c":
+                    sh.draw_bezier(*[fitz.Point(p.x, p.y + dy) for p in it[1:5]])
+            cap = d.get("lineCap", 0)
+            cap = cap[0] if isinstance(cap, (list, tuple)) and cap else (cap or 0)
+            kw = dict(color=d.get("color"), fill=d.get("fill"), width=d.get("width") or 0,
+                      dashes=d.get("dashes"), lineCap=int(cap), lineJoin=int(d.get("lineJoin") or 0),
+                      closePath=bool(d.get("closePath", False)), even_odd=bool(d.get("even_odd", False)))
+            try:
+                sh.finish(fill_opacity=d.get("fill_opacity", 1), stroke_opacity=d.get("stroke_opacity", 1), **kw)
+            except TypeError:
+                sh.finish(**kw)
+            sh.commit(overlay=True)
+            n += 1
+        except Exception as e:               # one odd path must never abort the edit
+            print(f"[edit] could not move a drawing: {e}", flush=True)
+    return n
+
+
+def _same_path(a: dict, b: dict) -> bool:
+    ra, rb = a["rect"], b["rect"]
+    return (a.get("type") == b.get("type") and abs(ra.x0 - rb.x0) < 0.6 and abs(ra.x1 - rb.x1) < 0.6
+            and abs(ra.y0 - rb.y0) < 0.6 and abs(ra.y1 - rb.y1) < 0.6)
+
+
+def paint_out_drawing(page: fitz.Page, d: dict) -> None:
+    """Last resort for a path the redaction could not delete: cover just its strokes with the local
+    background (thin, never a box), so nothing but the line itself is touched."""
+    bg = sample_bg(page, fitz.Rect(d["rect"]) + (-1, -1, 1, 1), pad=3.0)
+    w = float(d.get("width") or 0.5) + 1.2
+    stroked = d.get("color") is not None and d.get("type") in ("s", "fs")
+    for it in d["items"]:
+        if it[0] == "l" and stroked:
+            page.draw_line(it[1], it[2], color=bg, width=w, overlay=True)
+        elif it[0] == "re":
+            if d.get("fill") is not None and d.get("type") in ("f", "fs"):
+                page.draw_rect(it[1], color=None, fill=bg, overlay=True)
+            if stroked:
+                page.draw_rect(it[1], color=bg, fill=None, width=w, overlay=True)
+
+
+def remove_drawings_verified(page: fitz.Page, drawings: list) -> bool:
+    """remove_drawings(), then re-read the page: any path that is STILL there is painted out. Without
+    this, a table's old top border / first-row lines stayed behind next to the moved copy."""
+    if not remove_drawings(page, drawings):
+        return False
+    try:
+        left = [d for d in drawings if any(_same_path(d, n) for n in page.get_drawings())]
+    except Exception:
+        return True
+    for d in left:
+        try:
+            paint_out_drawing(page, d)
+        except Exception as e:
+            print(f"[edit] could not paint out a drawing: {e}", flush=True)
+    print(f"[edit] moved {len(drawings)} drawings, {len(left)} needed painting out", flush=True)
+    return True

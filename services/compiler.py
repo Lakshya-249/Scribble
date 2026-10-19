@@ -5,7 +5,8 @@ from typing import List, Tuple, Optional
 
 from services.spatial_cluster import ParagraphBlock, BULLET_CHARS
 from services.obj_reflow import ReflowResult
-from services.erase_service import safe_erase, erase_underline_rect, remove_underline, draw_underline
+from services.erase_service import (safe_erase, erase_underline_rect, remove_underline, draw_underline,
+                                    collect_drawings_below, remove_drawings_verified, redraw_drawings)
 from services.font_service import (
     font_chain,
     register_font_name,
@@ -271,6 +272,19 @@ class PDFCompiler:
                 and looks_right_aligned(target_block, all_blocks)):
             plan[0][0] = target_x1 - plan[0][3]
 
+        # ---- 2a. Vector art below the edit (table borders, shading, rules, underlines) must follow the text
+        drawings_to_move = []
+        if abs(height_delta) > 1.0:
+            cand = collect_drawings_below(page, target_y1 - 1.0, target_x0, target_x1)
+            if cand and remove_drawings_verified(page, cand):
+                drawings_to_move = cand
+        moved_rects = [fitz.Rect(d["rect"]) for d in drawings_to_move]
+
+        def _moved(u):
+            """this underline rect is one of the paths moved above (so don't treat it separately)"""
+            return any(abs(r.x0 - u[0]) < 1.0 and abs(r.x1 - u[2]) < 1.0
+                       and abs((r.y0 + r.y1) / 2 - (u[1] + u[3]) / 2) < 1.5 for r in moved_rects)
+
         # ---- 2. Erase old text AND old vector underlines
         # Erase old text AND all associated vector underlines
         safe_erase(page, target_block.bbox, fill_bg=False, ghost=ghost)
@@ -290,12 +304,18 @@ class PDFCompiler:
             safe_erase(page, db.bbox, fill_bg=False, ghost=ghost)
             for ln in db.lines:
                 for urect in getattr(ln, "underline_rects", ()):
+                    if _moved(urect):
+                        continue
                     remove_underline(page, urect)
                     erase_underline_rect(page, urect)   # also wipes anti-aliased remnants of the old line
 
         # target block's own underlines (its text is re-typeset, so they are redrawn below)
         for urect in getattr(target_block, "underline_rects", ()):
             erase_underline_rect(page, urect)
+
+        # moved vector art goes down BEFORE any text is drawn (cell shading must not cover glyphs)
+        if drawings_to_move:
+            redraw_drawings(page, drawings_to_move, height_delta)
 
         # ---- 3. Draw planned runs and new underlines
         for x, y, planned, _, extra_space_w in plan:
@@ -320,6 +340,8 @@ class PDFCompiler:
                     draw_pieces(page, ox, oy + dy, pieces, st, fb, self.cache)
                 cols = list(getattr(ln, "underline_colors", []))
                 for k, (ux0, uy0, ux1, uy1) in enumerate(getattr(ln, "underline_rects", ())):
+                    if _moved((ux0, uy0, ux1, uy1)):
+                        continue
                     draw_underline(page, (ux0, uy0 + dy, ux1, uy1 + dy), rgb(cols[k] if k < len(cols) else 0))
         for lk in moved_links:
             r = fitz.Rect(lk["from"])
