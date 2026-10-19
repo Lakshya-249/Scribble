@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  pdfsurgeon:
+    build: .
+    container_name: pdf_surgeon_app
+    ports:
+      - "8000:8000"
+    environment:
+      - COOKIE_SECURE=0  # Set to 1 if you put this behind HTTPS / Nginx SSL on your VM
+      - MAX_SESSIONS=50
+      - SESSION_TTL=1800
+    restart: unless-stopped
