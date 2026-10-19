@@ -39,19 +39,26 @@ def old_char_styles(block) -> List[Style]:
 
     block.text was built from the tokens plus separators the extractor invented (word
     spaces, line breaks). Walk both in parallel: a matching character takes its token's
-    style, an invented separator takes the style of the character before it."""
-    flat = [t for ln in block.lines for t in ln.tokens]
+    style, an invented separator takes the style of the character before it.
+    Whitespace tokens in PDFs often carry stray body-font sizes/colours, so only visible
+    (non-whitespace) tokens are allowed to update `last`."""
+    flat = [t for ln in block.lines for t in ln.tokens if not t.char.isspace()]
     if not flat:
-        return [DEFAULT_STYLE] * len(block.text)
+        all_toks = [t for ln in block.lines for t in ln.tokens]
+        return [style_of(all_toks[0]) if all_toks else DEFAULT_STYLE] * len(block.text)
+
     out: List[Style] = []
     j, last = 0, style_of(flat[0])
     for ch in block.text:
+        if ch.isspace():
+            out.append(last)
+            continue
         if j < len(flat) and flat[j].char == ch:
             last = style_of(flat[j])
             j += 1
-        elif not ch.isspace():
-            # a token was dropped (tracking space etc.): resync a few tokens ahead
-            for k in range(j + 1, min(j + 4, len(flat))):
+        else:
+            # a token was dropped or desynced: resync a few tokens ahead
+            for k in range(j + 1, min(j + 12, len(flat))):
                 if flat[k].char == ch:
                     j = k
                     last = style_of(flat[j])
@@ -61,10 +68,21 @@ def old_char_styles(block) -> List[Style]:
     return out
 
 
+def _dominant_style(styles: List[Style]) -> Style:
+    """Return the most frequent style in the block so boundary insertions match the heading."""
+    if not styles:
+        return DEFAULT_STYLE
+    counts = {}
+    for st in styles:
+        counts[st] = counts.get(st, 0) + 1
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
 def new_char_styles(old_text: str, old_styles: List[Style], new_text: str) -> List[Style]:
     """One Style per character of new_text (same length)."""
     if not old_styles:
         return [DEFAULT_STYLE] * len(new_text)
+    dominant = _dominant_style(old_styles)
     out: List[Style] = []
     sm = SequenceMatcher(None, old_text, new_text, autojunk=False)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -74,7 +92,13 @@ def new_char_styles(old_text: str, old_styles: List[Style], new_text: str) -> Li
             for k in range(j2 - j1):
                 out.append(old_styles[min(i1 + k, i2 - 1)])
         elif tag == "insert":
-            out.extend([old_styles[i1 - 1] if i1 > 0 else old_styles[0]] * (j2 - j1))
+            # Use dominant block style for insertions at the start/end,
+            # and local neighbor style for insertions in the middle.
+            if i1 == 0 or i1 == len(old_text):
+                st = dominant
+            else:
+                st = old_styles[i1 - 1] if i1 > 0 else dominant
+            out.extend([st] * (j2 - j1))
         # "delete": nothing to add
     if len(out) != len(new_text):                 # cannot happen; stay safe anyway
         return [old_styles[0]] * len(new_text)

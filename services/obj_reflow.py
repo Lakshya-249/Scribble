@@ -54,7 +54,8 @@ class TextReflowEngine:
 
         # If the original block was already a wide multi-line body, respect its right margin.
         # If it was a short heading/bullet, allow it to expand across the line.
-        max_allowed_width = original_width if original_width > 280.0 else available_page_width
+        # max_allowed_width = original_width if original_width > 280.0 else available_page_width
+        max_allowed_width = (original_width + 15.0) if original_width > 280.0 else available_page_width
 
         # Split preserving explicit line breaks (\n)
         paragraphs_or_lines = new_text.split("\n")
