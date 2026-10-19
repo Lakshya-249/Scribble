@@ -65,6 +65,8 @@ class TextLine:
     first_word_w: float = 0.0
     text_x0: float = 0.0  # True starting X of text (excluding bullet symbol)
     underline_rects: List[Tuple[float, float, float, float]] = field(default_factory=list)
+    underline_colors: List[int] = field(default_factory=list)   # parallel to underline_rects
+    char_tok: List[Optional["CharToken"]] = field(default_factory=list)  # parallel to .text (None = inferred space)
 
     def _word_gap_em(self) -> float:
         gaps = []
@@ -124,6 +126,7 @@ class TextLine:
 
         thr = self._word_gap_em()
         chars_out = []
+        tok_out = []
         first_end = None
         advancing_x2 = self.tokens[0].bbox[2]
 
@@ -146,17 +149,20 @@ class TextLine:
                         and not t.char.isspace()
                         and abs(t.origin[1] - prev_t.origin[1]) < size * 0.5):
                     chars_out.append(" ")
+                    tok_out.append(None)
                     if first_end is None:
                         first_end = effective_prev_x2
                 elif t.char.isspace() and first_end is None:
                     first_end = effective_prev_x2
             chars_out.append(t.char)
+            tok_out.extend([t] * len(t.char))
             advancing_x2 = max(advancing_x2, t.bbox[2])
 
         if first_end is None:
             first_end = advancing_x2
         self.first_word_w = max(0.0, first_end - self.tokens[0].bbox[0])
         self.text = "".join(chars_out)
+        self.char_tok = tok_out if len(tok_out) == len(self.text) else []
 
 
 @dataclass
@@ -170,6 +176,8 @@ class ParagraphBlock:
     hanging_indent: float = 0.0
     container_max_x1: Optional[float] = None
     underline_rects: List[Tuple[float, float, float, float]] = field(default_factory=list)
+    char_tok: Optional[list] = None    # parallel to .text: CharToken, or None for inferred spaces / separators
+    char_line: Optional[list] = None   # parallel to .text: index into .lines, or -1 for separators
 
     def finalize(self):
         if not self.lines:
@@ -237,18 +245,25 @@ class ParagraphBlock:
         list_like = len(self.lines) >= 2 and (top >= max(2, 0.6 * len(self.lines)) or bullet >= 2)
         flowing = (not list_like and len(self.lines) >= 2
                    and (right - self.lines[-1].bbox[2]) > -2.0)
-        parts = []
+        parts, ct, cl = [], [], []
         for k, ln in enumerate(self.lines):
             parts.append(ln.text)
+            ct.extend(ln.char_tok if ln.char_tok else [None] * len(ln.text))
+            cl.extend([k] * len(ln.text))
             if k + 1 < len(self.lines):
                 nxt = self.lines[k + 1]
                 need = nxt.first_word_w + 0.25 * ln.dominant_font_size
                 if flowing and (right - ln.bbox[2]) < need + 4.0:
                     hyphen = ln.text.endswith("-") and nxt.text[:1].islower()
-                    parts.append("" if (hyphen or ln.text.endswith(" ")) else " ")
+                    sep = "" if (hyphen or ln.text.endswith(" ")) else " "
                 else:
-                    parts.append("\n")
+                    sep = "\n"
+                parts.append(sep)
+                ct.extend([None] * len(sep))
+                cl.extend([-1] * len(sep))
         self.text = "".join(parts)
+        ok = all(ln.char_tok for ln in self.lines) and len(ct) == len(self.text)
+        self.char_tok, self.char_line = (ct, cl) if ok else (None, None)
 
 
 def _has_v_barrier(x_left: float, x_right: float, y_top: float, y_bot: float,
@@ -352,6 +367,7 @@ class SpatialClusterer:
                     if overlap_x >= 3.0 and seg_w <= line_w + 18.0:
                         matched_as_underline = True
                         ln.underline_rects.append((hx0, hy0, hx1, hy1))
+                        ln.underline_colors.append(int(seg[4]) if len(seg) > 4 else 0)
                         for tok in ln.tokens:
                             if not tok.char.isspace():
                                 tx_mid = (tok.bbox[0] + tok.bbox[2]) * 0.5

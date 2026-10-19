@@ -142,3 +142,18 @@ def safe_erase(page: fitz.Page, rect: fitz.Rect, fill_bg: bool = False, images: 
         ghost.extend([c, x, y] for c, x, y, bb in fresh
                      if r.contains(fitz.Point((bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2)))
     return "clipped"
+
+
+def remove_line_art(page: fitz.Page, rect, pad: float = 0.3) -> bool:
+    """Delete the vector path(s) lying entirely inside `rect` (an old underline) WITHOUT painting
+    over anything: table borders and cell shading next to it survive, and text is left alone.
+    Returns False if this PyMuPDF cannot do it, so the caller can fall back to painting."""
+    r = fitz.Rect(rect) + (-pad, -pad, pad, pad)
+    try:
+        page.add_redact_annot(r, fill=False)
+        page.apply_redactions(images=0, graphics=1, text=fitz.PDF_REDACT_TEXT_NONE)
+        return True
+    except (TypeError, AttributeError, ValueError):
+        for a in list(page.annots(types=[fitz.PDF_ANNOT_REDACT]) or []):
+            page.delete_annot(a)
+        return False

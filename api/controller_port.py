@@ -15,6 +15,7 @@ from services.spatial_cluster import SpatialClusterer, ParagraphBlock
 from services.obj_reflow import TextReflowEngine
 from services.compiler import PDFCompiler, draw_text_with_glyph_fallback, compute_empirical_width_scale
 from services.erase_service import safe_erase
+from services.diff_edit import try_diff_edit
 from services.font_service import reset_cache, font_chain
 
 router = APIRouter()
@@ -227,6 +228,13 @@ def _edit(s: Session, op: dict) -> dict:
                 if target is None:
                     raise ValueError("Text not found on this page - reload the page and try again.")
 
+                # 1) minimal-diff edit: unchanged glyphs, borders and underlines are never touched
+                rep = try_diff_edit(doc, page_num, target, new_text, blocks, s.cache, ghost)
+                if rep is not None:
+                    s.blocks.pop(page_num, None)
+                    return {"missing": rep["substituted"], "note": "Edit applied"}
+
+                # 2) fallback: re-typeset the paragraph (old behaviour)
                 first_baseline = target.lines[0].baseline_y if target.lines else target.bbox[1] + 10.0
                 size = target.lines[0].dominant_font_size if target.lines else 11.0
                 first_tok = target.lines[0].tokens[0] if (target.lines and target.lines[0].tokens) else None
