@@ -157,3 +157,39 @@ def remove_line_art(page: fitz.Page, rect, pad: float = 0.3) -> bool:
         for a in list(page.annots(types=[fitz.PDF_ANNOT_REDACT]) or []):
             page.delete_annot(a)
         return False
+
+
+
+def _hairline_present(page: fitz.Page, x0: float, x1: float, ym: float) -> bool:
+    for d in page.get_drawings():
+        r = d.get("rect")
+        if r is None:
+            continue
+        if (r.height <= 3.5 and r.width >= 4.0 and abs((r.y0 + r.y1) / 2 - ym) <= 1.0
+                and r.x0 >= x0 - 1.0 and r.x1 <= x1 + 1.0 and r.width >= 0.8 * (x1 - x0)):
+            return True
+    return False
+
+
+def remove_underline(page: fitz.Page, rect) -> None:
+    """Get rid of one old underline. Works for hairline strokes too (their rect has height 0).
+    1) delete exactly that path; 2) check it is really gone; 3) only if not, paint a band that is
+    just ~1pt tall over it (never the +-2pt box the old code used, which swallowed table borders)."""
+    x0, y0, x1, y1 = rect
+    ym = (y0 + y1) / 2.0
+    band = fitz.Rect(x0, ym - 0.6, x1, ym + 0.6)
+    remove_line_art(page, band)
+    if _hairline_present(page, x0, x1, ym):
+        thin = fitz.Rect(x0, ym - 0.45, x1, ym + 0.45)
+        page.draw_rect(thin, color=None, fill=sample_bg(page, thin, pad=1.0), overlay=True)
+
+
+def draw_underline(page: fitz.Page, rect, rgb_colour) -> None:
+    """Draw an underline of the given extent. A zero-height rect is a hairline: it must be STROKED,
+    a zero-area fill is invisible (this was the 'underline did not follow my edit' bug)."""
+    x0, y0, x1, y1 = rect
+    if y1 - y0 < 0.5:
+        ym = (y0 + y1) / 2.0
+        page.draw_line(fitz.Point(x0, ym), fitz.Point(x1, ym), color=rgb_colour, width=0.5)
+    else:
+        page.draw_rect(fitz.Rect(rect), color=None, fill=rgb_colour, overlay=True)

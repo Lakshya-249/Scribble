@@ -69,7 +69,19 @@ def _shift(ctx: dict, x0: float, x1: float) -> Tuple[float, float]:
     r = rid[id(first)] if first is not None else None
     s0 = sum(o.delta for o in ops if o.run == r and o.old_x1 < x0 - 0.5)
     inside = sum(o.delta for o in ops if o.run == r and o.old_x0 >= x0 - 0.5 and o.old_x1 <= x1 + 0.6)
-    return x0 + s0, x1 + s0 + inside
+    nx0, nx1 = x0 + s0, x1 + s0 + inside
+    # An underline stops at the last visible glyph, but the line often ends with a blank glyph.
+    # Text typed after those blanks continues the underlined run, so the underline grows to cover it.
+    x1e = x1
+    for t in toks:
+        if t.bbox[0] >= x1 - 0.5:
+            if not t.char.isspace():
+                break
+            x1e = max(x1e, t.bbox[2])
+    for o in ops:
+        if o.run == r and x1 + 0.6 < o.old_x0 <= x1e + 0.6 and o.new_w > 0:
+            nx1 = max(nx1, o.x + o.new_w)
+    return nx0, nx1
 
 
 def _merge(rects: List[tuple]) -> List[tuple]:
@@ -90,11 +102,19 @@ def plan_diff(block, new_text: str, measure: Callable[[int, int], float], limit_
     if not ct or not cl or len(ct) != len(old) or len(cl) != len(old):
         return _fail("no-char-map")
 
-    codes = [c for c in SequenceMatcher(None, old, new_text, autojunk=False).get_opcodes() if c[0] != "equal"]
+    n_old = len(old)
+
+    def is_trailing_blank_delete(c):
+        # editors usually trim the blank glyph at the end of a line; that is not a real edit
+        tag, i1, i2, j1, j2 = c
+        return (j1 == j2 and old[i1:i2].isspace()
+                and (i2 >= n_old or cl[i2] != cl[i2 - 1]))
+
+    codes = [c for c in SequenceMatcher(None, old, new_text, autojunk=False).get_opcodes()
+             if c[0] != "equal" and not is_trailing_blank_delete(c)]
     plan = DiffPlan()
     if not codes:
         return plan
-    n_old = len(old)
 
     def real_before(i, line):
         k = i - 1
