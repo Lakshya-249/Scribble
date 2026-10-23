@@ -45,7 +45,7 @@ def try_diff_edit(doc, page_num, block, new_text, all_blocks, cache, ghost):
 
     # 1. erase only what changed / has to move (fill stays transparent: cell shading is kept)
     for rect in plan.erase_rects:
-        safe_erase(page, fitz.Rect(rect), fill_bg=False, ghost=ghost)
+        safe_erase(page, fitz.Rect(rect), fill_bg=False, ghost=ghost, cache=cache)
 
     # 2. move underlines: remove the exact old path, draw it again with the new extent and old colour
     for old, new, colour in plan.underlines:

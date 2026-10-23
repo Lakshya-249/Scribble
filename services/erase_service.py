@@ -1,5 +1,8 @@
 import collections
+import logging
 import pymupdf as fitz
+
+log = logging.getLogger("scribble.erase")
 
 DRIFT_TOL = 0.75
 
@@ -15,13 +18,16 @@ def char_sig(page: fitz.Page):
     return out
 
 
-def drift(before, after, skip: fitz.Rect):
+def drift(before, after, skip):
+    """Glyphs of `before` that are missing from `after` (or moved), ignoring anything inside `skip`
+    (one Rect or a list of Rects: those glyphs are meant to disappear)."""
+    skips = [skip] if isinstance(skip, fitz.Rect) else list(skip)
     grid = collections.defaultdict(list)
     for c, x, y, _ in after:
         grid[(c, int(x // 3), int(y // 3))].append((x, y))
     bad = []
     for c, x, y, bb in before:
-        if fitz.Rect(bb).intersects(skip):
+        if any(fitz.Rect(bb).intersects(k) for k in skips):
             continue
         gx, gy, ok = int(x // 3), int(y // 3), False
         for a in (-1, 0, 1):
@@ -100,24 +106,87 @@ def hide_rect(page: fitz.Page, r: fitz.Rect, bg):
 
 
 def _redact(page: fitz.Page, r: fitz.Rect, fill, images: int):
-    page.add_redact_annot(r, fill=fill or False)
+    _redact_many(page, [(r, fill)], images)
+
+
+def _redact_many(page: fitz.Page, items, images: int):
+    for rect, fill in items:
+        page.add_redact_annot(rect, fill=fill or False)
     try:
         page.apply_redactions(images=images, graphics=0)
     except TypeError:
         page.apply_redactions(images=images)
 
 
-def _redaction_is_safe(page: fitz.Page, r: fitz.Rect, fill, images: int, before) -> bool:
+def _drift_after(page: fitz.Page, items, images: int, before, skip, expect_removed: int = None) -> list:
+    """Run the redaction on a throw-away copy of the page; return the glyphs it would move.
+    None means the simulation itself failed (treat as unsafe). With `expect_removed`, the glyph
+    count must drop by exactly that many (proves nothing we meant to delete survived)."""
     tmp = fitz.open()
     try:
         tmp.insert_pdf(page.parent, from_page=page.number, to_page=page.number)
-        tp = tmp[0]
-        _redact(tp, r, fill, images)
-        return not drift(before, char_sig(tp), r + (-1.5, -1.5, 1.5, 1.5))
+        _redact_many(tmp[0], items, images)
+        after = char_sig(tmp[0])
+        if expect_removed is not None and len(before) - len(after) != expect_removed:
+            return None
+        return drift(before, after, skip)
     except Exception:
-        return False
+        return None
     finally:
         tmp.close()
+
+
+def _redaction_is_safe(page: fitz.Page, r: fitz.Rect, fill, images: int, before) -> bool:
+    return _drift_after(page, [(r, fill)], images, before, r + (-1.5, -1.5, 1.5, 1.5)) == []
+
+
+def _glyph_records(page: fitz.Page):
+    """Every visible glyph with the style it was drawn in (horizontal text only)."""
+    out = []
+    for b in page.get_text("rawdict")["blocks"]:
+        for ln in b.get("lines", []):
+            dx, dy = ln.get("dir", (1.0, 0.0))
+            horizontal = abs(dy) < 0.01 and dx > 0.99
+            for si, sp in enumerate(ln["spans"]):
+                for ci, c in enumerate(sp["chars"]):
+                    out.append({"c": c["c"], "x": c["origin"][0], "y": c["origin"][1], "bbox": tuple(c["bbox"]),
+                                "font": sp["font"], "flags": int(sp["flags"]), "size": float(sp["size"]),
+                                "color": int(sp["color"] or 0), "ok": horizontal, "span": id(sp), "k": ci})
+    return out
+
+
+def _reanchor(page: fitz.Page, glyphs: list, cache: dict):
+    """Draw glyphs again where they were, one word at a time so the text layer stays readable."""
+    from services.compiler import layout_run, draw_pieces      # lazy: compiler imports this module
+    from services.style_runs import Style, Run
+    glyphs = sorted(glyphs, key=lambda g: (g["span"], g["k"]))
+    word, missing = [], set()
+
+    def flush():
+        if not word:
+            return
+        g0 = word[0]
+        st = Style(g0["font"], g0["flags"], round(g0["size"], 3), g0["color"], False)
+        pieces, fb = layout_run(page, page.parent, Run("".join(g["c"] for g in word), st), cache)
+        for pc in pieces:
+            if pc.substituted:
+                missing.update(ch for ch in pc.text if not ch.isspace())
+        draw_pieces(page, g0["x"], g0["y"], pieces, st, fb, cache)
+        word.clear()
+
+    for g in glyphs:
+        if not g["c"].strip():
+            flush()
+            continue
+        if word:
+            w = word[-1]
+            same = (g["span"] == w["span"] and g["k"] == w["k"] + 1 and abs(g["y"] - w["y"]) < 0.3
+                    and (g["font"], g["flags"], g["size"], g["color"]) == (w["font"], w["flags"], w["size"], w["color"]))
+            if not same:
+                flush()
+        word.append(g)
+    flush()
+    return missing
 
 
 def erase_underline_rect(page: fitz.Page, rect: tuple):
@@ -127,14 +196,76 @@ def erase_underline_rect(page: fitz.Page, rect: tuple):
     page.draw_rect(r, color=None, fill=bg, overlay=True)
 
 
-def safe_erase(page: fitz.Page, rect: fitz.Rect, fill_bg: bool = False, images: int = 0, ghost: list = None):
+def safe_erase(page: fitz.Page, rect: fitz.Rect, fill_bg: bool = False, images: int = 0, ghost: list = None,
+               cache: dict = None):
+    """Remove whatever is inside `rect`.
+
+    1. Plain redaction when it leaves every other glyph where it was.
+    2. Otherwise (MuPDF closes the gap after a deleted glyph, shifting the rest of that text string)
+       redact the shifted glyphs as well and draw them again at their original positions. The old text is
+       really gone from the file.
+    3. Last resort: clip the old glyphs away. They stay in the file, so they are remembered in `ghost`.
+    Returns "redacted", "reanchored" or "clipped".
+    """
     r = fitz.Rect(rect)
     before = char_sig(page)
     bg = sample_bg(page, r) if fill_bg else None
+    pad = r + (-1.5, -1.5, 1.5, 1.5)
 
-    if _redaction_is_safe(page, r, bg, images, before):
+    bad = _drift_after(page, [(r, bg)], images, before, pad)
+    if bad == []:
         _redact(page, r, bg, images)
         return "redacted"
+
+    if bad and cache is not None:
+        try:
+            recs = _glyph_records(page)
+            idx = collections.defaultdict(list)
+            for g in recs:
+                idx[(g["c"], int(g["x"] // 3), int(g["y"] // 3))].append(g)
+            moved = []
+            for c, x, y in bad:
+                hit = next((g for a in (-1, 0, 1) for b2 in (-1, 0, 1)
+                            for g in idx.get((c, int(x // 3) + a, int(y // 3) + b2), ())
+                            if abs(g["x"] - x) < 0.2 and abs(g["y"] - y) < 0.2), None)
+                moved.append(hit)
+            if moved and all(g is not None and g["ok"] for g in moved):
+                # MuPDF tests later glyphs at their already shifted position, so one box per line must
+                # reach from the first deleted glyph to the last shifted one: shifted glyphs stay inside it.
+                bands = []
+                for g in sorted(moved, key=lambda g: (g["y"], g["x"])):
+                    gb = fitz.Rect(g["bbox"])
+                    for bd in bands:
+                        if abs(bd["y"] - g["y"]) < 2.0:
+                            bd["rect"] |= gb
+                            break
+                    else:
+                        bands.append({"y": g["y"], "rect": gb})
+                boxes = []
+                for bd in bands:
+                    rr = bd["rect"]
+                    if r.y0 < rr.y1 and r.y1 > rr.y0:
+                        rr = rr | r
+                    boxes.append(rr + (0.2, 0.2, -0.2, -0.2))
+                def _in_r(g):
+                    return r.contains(fitz.Point((g["bbox"][0] + g["bbox"][2]) / 2, (g["bbox"][1] + g["bbox"][3]) / 2))
+
+                def _in_box(g):
+                    return any(fitz.Rect(g["bbox"]).intersects(bx) for bx in boxes)
+
+                vis = [g for g in recs if g["c"].strip()]
+                gone = [g for g in vis if _in_r(g) or _in_box(g)]
+                redraw = [g for g in gone if not _in_r(g)]
+                if not all(g["ok"] for g in redraw):
+                    raise ValueError("rotated text")
+                items = [(r, bg)] + [(bx, None) for bx in boxes]
+                skips = [pad] + [bx + (-1, -1, 1, 1) for bx in boxes]
+                if _drift_after(page, items, images, before, skips, expect_removed=len(gone)) == []:
+                    _redact_many(page, items, images)
+                    _reanchor(page, [g for g in recs if g in redraw or (not g["c"].strip() and _in_box(g) and not _in_r(g))], cache)
+                    return "reanchored"
+        except Exception:
+            pass                                    # fall through to clipping
 
     hide_rect(page, r, bg or sample_bg(page, r))
     if ghost is not None:
@@ -265,7 +396,7 @@ def redraw_drawings(page: fitz.Page, drawings: list, dy: float) -> int:
             sh.commit(overlay=True)
             n += 1
         except Exception as e:               # one odd path must never abort the edit
-            print(f"[edit] could not move a drawing: {e}", flush=True)
+            log.debug("could not move a drawing: %s", e)
     return n
 
 
@@ -304,6 +435,6 @@ def remove_drawings_verified(page: fitz.Page, drawings: list) -> bool:
         try:
             paint_out_drawing(page, d)
         except Exception as e:
-            print(f"[edit] could not paint out a drawing: {e}", flush=True)
-    print(f"[edit] moved {len(drawings)} drawings, {len(left)} needed painting out", flush=True)
+            log.debug("could not paint out a drawing: %s", e)
+    log.debug("moved %d drawings, %d needed painting out", len(drawings), len(left))
     return True

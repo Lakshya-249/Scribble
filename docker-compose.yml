@@ -1,13 +1,18 @@
-version: '3.8'
-
 services:
-  pdfsurgeon:
+  scribble:
     build: .
-    container_name: pdf_surgeon_app
+    container_name: scribble
     ports:
       - "8000:8000"
     environment:
-      - COOKIE_SECURE=0  # Set to 1 if you put this behind HTTPS / Nginx SSL on your VM
-      - MAX_SESSIONS=50
-      - SESSION_TTL=1800
+      # REQUIRED when hosted: the public host name(s), comma separated. Requests for any other Host are refused.
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1}
+      # Set to 1 once the site is served over HTTPS.
+      - COOKIE_SECURE=${COOKIE_SECURE:-0}
+      - MAX_SESSIONS=${MAX_SESSIONS:-50}
+      - SESSION_TTL=${SESSION_TTL:-1800}
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-60}
+      # AGPL: link to the source of the version you run (shown in the footer).
+      - SOURCE_URL=${SOURCE_URL:-}
     restart: unless-stopped
+    mem_limit: 2g

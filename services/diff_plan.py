@@ -13,7 +13,32 @@ from difflib import SequenceMatcher
 from typing import Callable, Dict, List, Optional, Tuple
 
 TOL = 0.7        # pt. A width change smaller than this is treated as "same width": nothing else moves.
+WHOLE_WORDS = True   # redraw whole words (clean copy/search text) instead of single changed glyphs
 BREAK_EM = 0.9   # a gap wider than this many em separates independent runs (cells, bullet marker)
+
+
+def snap_to_words(old: str, new: str, codes: list) -> list:
+    """Grow every change to the whole word(s) it touches, so a replaced word is drawn as one piece.
+
+    A character-level diff turns quick -> slow into 'sl' + 'ow' drawn around a surviving 'o' glyph;
+    the page looks right but copy, search and screen readers see fragments. Whole words keep the text
+    layer clean. Whitespace is never crossed, so line structure is unaffected."""
+    out: list = []
+    for tag, i1, i2, j1, j2 in codes:
+        left = (i1 < i2 and not old[i1].isspace()) or (j1 < j2 and not new[j1].isspace())
+        right = (i1 < i2 and not old[i2 - 1].isspace()) or (j1 < j2 and not new[j2 - 1].isspace())
+        while left and i1 > 0 and j1 > 0 and old[i1 - 1] == new[j1 - 1] and not old[i1 - 1].isspace():
+            i1 -= 1
+            j1 -= 1
+        while right and i2 < len(old) and j2 < len(new) and old[i2] == new[j2] and not old[i2].isspace():
+            i2 += 1
+            j2 += 1
+        if out and i1 <= out[-1][2] and j1 <= out[-1][4]:
+            _, pi1, pi2, pj1, pj2 = out[-1]
+            out[-1] = ("replace", pi1, max(pi2, i2), pj1, max(pj2, j2))
+        else:
+            out.append((tag, i1, i2, j1, j2))
+    return out
 
 
 @dataclass
@@ -115,6 +140,8 @@ def plan_diff(block, new_text: str, measure: Callable[[int, int], float], limit_
     plan = DiffPlan()
     if not codes:
         return plan
+    if WHOLE_WORDS:
+        codes = snap_to_words(old, new_text, codes)
 
     # A line break was typed or removed. The diff path only draws glyphs on the existing line
     # positions, so a "\n" would be silently dropped and the new text would land on the same line.

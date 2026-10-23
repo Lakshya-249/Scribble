@@ -1,4 +1,10 @@
-patch
+.venv
+.git
+__pycache__
+*.pyc
+tests
 temp
+patch
 *.zip
 *.sh
+.env

@@ -1,7 +1,7 @@
 """Per-user sessions. Every browser gets a random cookie; every cookie owns its own
 document, undo stack, font caches and temp folder, so users cannot see or overwrite each
 other's work. Idle sessions are deleted (files included)."""
-import os, re, time, shutil, secrets, tempfile, threading, http.cookies
+import os, re, time, shutil, secrets, tempfile, threading, http.cookies, collections
 from typing import Optional
 
 from services.font_service import new_cache
@@ -10,6 +10,9 @@ MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 20))
 TTL = int(os.environ.get("SESSION_TTL", 1800))          # seconds of inactivity
 MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_MB", 60)) * 1024 * 1024
 MAX_PAGES = int(os.environ.get("MAX_PAGES", 1000))
+MAX_UNDO = int(os.environ.get("MAX_UNDO", 20))                       # undo steps kept per user
+MAX_UNDO_BYTES = int(os.environ.get("MAX_UNDO_MB", 300)) * 1024 * 1024   # disk budget for undo+redo snapshots
+RENDER_CACHE = int(os.environ.get("RENDER_CACHE", 24))               # rendered page images kept per user
 HEAVY = threading.BoundedSemaphore(int(os.environ.get("WORKERS", max(2, os.cpu_count() or 2))))
 
 ROOT = tempfile.mkdtemp(prefix="pdfsurgeon_")
@@ -24,7 +27,11 @@ class Session:
         os.makedirs(self.dir)
         self.doc = None
         self.pw = ""
+        self.name = "document.pdf"  # original file name, used for the download
+        self.rev = 0              # bumps on every change; page images are cached per revision
+        self.render = collections.OrderedDict()   # (page, scale) -> png bytes, cleared on every change
         self.undo = []            # [(snapshot_path, ghost_copy)]
+        self.redo = []
         self.ghost = {}           # page -> [[char, x, y], ...] hidden (clipped) old glyphs
         self.blocks = {}          # page -> paragraph blocks from the last /text call
         self.cache = new_cache()  # font caches (never shared between users)
@@ -38,6 +45,17 @@ class Session:
         except Exception:
             pass
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def end(cookie_header: Optional[str]) -> bool:
+    """Delete this browser's document and temp files right now (the 'delete my file' button)."""
+    s, _ = get(cookie_header, create=False)
+    if s is None:
+        return False
+    with s.lock:
+        with _LOCK:
+            _drop(s)
+    return True
 
 
 def _drop(s: Session):

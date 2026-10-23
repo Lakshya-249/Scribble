@@ -234,7 +234,6 @@ class PDFCompiler:
 
         # The old bullet->text gap (wide in many PDFs). Re-typesetting "● text" with one space would collapse it.
         cols = _bullet_cols(target_block) if getattr(target_block, "alignment", "left") == "left" else None
-        print(f"[edit] bullet columns (bullet_x, text_x) = {cols}", flush=True)
 
         for line in reflow_res.lines:
             runs, cursor = line_runs(line.text, new_text, new_styles, cursor, default)
@@ -287,7 +286,7 @@ class PDFCompiler:
 
         # ---- 2. Erase old text AND old vector underlines
         # Erase old text AND all associated vector underlines
-        safe_erase(page, target_block.bbox, fill_bg=False, ghost=ghost)
+        safe_erase(page, target_block.bbox, fill_bg=False, ghost=ghost, cache=self.cache)
         for urect in getattr(target_block, "underline_rects", ()):
             erase_underline_rect(page, urect)
 
@@ -301,7 +300,7 @@ class PDFCompiler:
                 if any(b.bbox[0] - 1 <= cx <= b.bbox[2] + 1 and b.bbox[1] - 1 <= cy <= b.bbox[3] + 1 for b in downstream):
                     moved_links.append(lk)
         for db in downstream:
-            safe_erase(page, db.bbox, fill_bg=False, ghost=ghost)
+            safe_erase(page, db.bbox, fill_bg=False, ghost=ghost, cache=self.cache)
             for ln in db.lines:
                 for urect in getattr(ln, "underline_rects", ()):
                     if _moved(urect):
