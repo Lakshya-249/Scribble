@@ -1,3 +1,4 @@
+import re
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
@@ -5,16 +6,35 @@ from typing import List, Tuple, Dict, Any, Optional
 BULLET_CHARS = set("\u2022\u2023\u25e6\u2043\u2219\u25cf\u25aa\u25ab\u25b8\u2013\u2014-*>\u00b7")
 
 
+_ROMAN = re.compile(r"^(?=[MDCLXVI])M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$")
+_GLYPH_BULLETS = set("\u2022\u2023\u25e6\u2043\u2219\u25cf\u25aa\u25ab\u25b8\u00b7")   # unambiguous symbols
+_AFTER_BULLET = " \t\u200b\u00a0\u2009\u2003"
+
+
+def _is_list_number(head: str) -> bool:
+    """'1.' '2)' '(a)' 'iv.' yes; 'Inc.' 'Ltd.' 'Fig.' '1990.' 'etc.' no (they start wrapped lines)."""
+    if not head or head[-1] not in ".)":
+        return False
+    core = head[:-1].lstrip("(")
+    if not core:
+        return False
+    if core.isdigit():
+        return len(core) <= 3
+    if len(core) == 1 and core.isalpha():
+        return True
+    return core.isalpha() and (core.isupper() or core.islower()) and len(core) <= 5 and bool(_ROMAN.match(core.upper()))
+
+
 def _starts_with_bullet(text: str) -> bool:
     s = text.lstrip()
     if not s:
         return False
-    if s[0] in BULLET_CHARS:
+    if s[0] in _GLYPH_BULLETS:
         return True
+    if s[0] in BULLET_CHARS:                       # '-', en/em dash, '*', '>' : only a marker if a blank follows
+        return len(s) == 1 or s[1] in _AFTER_BULLET or s[1].isspace()
     head = s.split(" ", 1)[0]
-    if 1 < len(head) <= 4 and head.rstrip(".)").lstrip("(").isalnum() and any(c in head for c in ".)"):
-        return True
-    return False
+    return len(s) > len(head) and _is_list_number(head)
 
 
 def _detect_hanging_indent(line_text: str, tokens: list) -> float:
@@ -36,7 +56,7 @@ def _detect_hanging_indent(line_text: str, tokens: list) -> float:
             prev = tokens[i - 1]
             if saw_gap or (t.bbox[0] - prev.bbox[2]) > prev.font_size * 0.12:
                 indent = t.bbox[0] - x0
-                if 4.0 <= indent <= 36.0:
+                if 4.0 <= indent <= 80.0:
                     return float(indent)
                 break
     return 0.0
@@ -198,7 +218,7 @@ class ParagraphBlock:
             self.hanging_indent = _detect_hanging_indent(self.lines[0].text, self.lines[0].tokens)
             if len(self.lines) >= 2 and self.hanging_indent == 0.0:
                 diff_indent = self.lines[1].bbox[0] - self.lines[0].bbox[0]
-                if 4.0 <= diff_indent <= 36.0 and _starts_with_bullet(self.lines[0].text):
+                if 4.0 <= diff_indent <= 80.0 and _starts_with_bullet(self.lines[0].text):
                     self.hanging_indent = float(diff_indent)
 
         # 2. Measure true baseline-to-baseline leading
@@ -398,6 +418,38 @@ class SpatialClusterer:
             lines.sort(key=lambda ln: (round(ln.baseline_y, 1), ln.bbox[0]))
             paragraphs: List[ParagraphBlock] = []
 
+            wrap_cache: Dict[int, float] = {}
+
+            def column_right(prev_line: TextLine) -> float:
+                """right edge of the text column prev_line belongs to (same font, horizontally overlapping)"""
+                key = id(prev_line)
+                if key not in wrap_cache:
+                    size = prev_line.dominant_font_size
+                    px0, _, px1, _ = prev_line.bbox
+                    ref = px1
+                    for o in lines:
+                        if abs(o.dominant_font_size - size) > max(0.5, 0.05 * size):
+                            continue
+                        ov = min(o.bbox[2], px1) - max(o.bbox[0], px0)
+                        if ov >= 0.5 * min(o.bbox[2] - o.bbox[0], px1 - px0):
+                            ref = max(ref, o.bbox[2])
+                    wrap_cache[key] = ref
+                return wrap_cache[key]
+
+            def soft_wrapped(prev_line: TextLine, line: TextLine) -> bool:
+                """prev_line is a full-width line that had no room for the first word of `line`"""
+                size = max(prev_line.dominant_font_size, 1.0)
+                if prev_line.bbox[2] - prev_line.bbox[0] < 15.0 * size:
+                    return False
+                return column_right(prev_line) - prev_line.bbox[2] <= line.first_word_w + size
+
+            def has_followup(line: TextLine, pitch: float) -> bool:
+                size = max(line.dominant_font_size, 1.0)
+                return any(abs(o.baseline_y - (line.baseline_y + pitch)) <= 3.5
+                           and abs(o.bbox[0] - line.bbox[0]) <= 3.0 * size
+                           and abs(o.dominant_font_size - line.dominant_font_size) <= max(0.5, 0.05 * size)
+                           for o in lines)
+
             for line in lines:
                 if _starts_with_bullet(line.text):
                     paragraphs.append(ParagraphBlock(lines=[line]))
@@ -413,13 +465,25 @@ class SpatialClusterer:
                         continue
 
                     median_size = (line.dominant_font_size + prev_line.dominant_font_size) / 2.0
+                    n = len(cand.lines)
                     max_lead = median_size * self.para_lead_ratio
                     if delta_y > max_lead:
-                        continue
+                        # 1.5x / double line spacing. Follow a pitch the paragraph already has, or accept a
+                        # first gap only when the previous line is visibly soft-wrapped and the pitch goes on.
+                        if n >= 2:
+                            prev_dy = cand.lines[-1].baseline_y - cand.lines[-2].baseline_y
+                            if not (prev_dy > max_lead * 0.9 and delta_y <= 3.2 * median_size
+                                    and abs(delta_y - prev_dy) <= max(3.5, 0.2 * prev_dy)):
+                                continue
+                        else:
+                            if delta_y > 2.7 * median_size or not soft_wrapped(prev_line, line):
+                                continue
+                            if not (has_followup(line, delta_y) or line.bbox[2] < prev_line.bbox[2] - 2.0 * median_size):
+                                continue
 
                     # STRICT ISOLATION: Never merge a line into a paragraph if there is a font size
                     # or style jump (e.g. merging a body word/name into a larger heading)
-                    if abs(line.dominant_font_size - prev_line.dominant_font_size) > 0.5:
+                    if abs(line.dominant_font_size - prev_line.dominant_font_size) > max(0.5, 0.05 * median_size):
                         continue
 
                     # STRICT ISOLATION: If the previous line is short and looks like a header/title
@@ -430,7 +494,7 @@ class SpatialClusterer:
                         if line.bbox[0] > prev_line.bbox[2] + 4.0:
                             continue
 
-                    if len(cand.lines) >= 2:
+                    if n >= 2 and delta_y <= max_lead:
                         prev_dy = cand.lines[-1].baseline_y - cand.lines[-2].baseline_y
                         if abs(delta_y - prev_dy) > max(3.5, median_size * 0.35):
                             continue
@@ -444,6 +508,12 @@ class SpatialClusterer:
                         (overlap_x > 0.0 and left_diff <= median_size * 2.5)
                         or left_diff <= median_size * 1.8
                     )
+                    if not has_spatial_continuity and n == 1 and overlap_x > 0.0:
+                        if curr_x0 < prev_x0 and (prev_x0 - curr_x0) <= min(6.5 * median_size, 90.0):
+                            has_spatial_continuity = True          # first line indented (e.g. 0.5 inch)
+                        elif (curr_x0 > prev_x0 and _starts_with_bullet(prev_line.text)
+                              and (curr_x0 - prev_x0) <= min(9.0 * median_size, 90.0)):
+                            has_spatial_continuity = True          # wide hanging indent under a bullet
                     if not has_spatial_continuity:
                         continue
 
@@ -455,8 +525,9 @@ class SpatialClusterer:
                     para_max_x1 = max(l.bbox[2] for l in cand.lines)
                     para_min_x0 = min(l.bbox[0] for l in cand.lines)
                     para_w = para_max_x1 - para_min_x0
-                    if len(cand.lines) >= 2 and para_w > 140.0:
-                        if (para_max_x1 - prev_x1) > max(45.0, para_w * 0.22):
+                    if n >= 2 and para_w > 140.0:
+                        # a short line in the middle ends the paragraph, unless the next word could not fit
+                        if (para_max_x1 - prev_x1) > max(45.0, para_w * 0.22, line.first_word_w + median_size):
                             continue
 
                     if delta_y < best_dy:

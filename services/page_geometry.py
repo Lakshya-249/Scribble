@@ -4,6 +4,25 @@ from typing import Dict, Any, Optional, Union, List, Tuple
 from services.erase_service import unghost
 
 
+def _is_invisible_patch(d: Dict[str, Any]) -> bool:
+    """Drawings that are not visible lines or borders and must never cut text lines apart:
+      - clip paths (the clip our own 'hide old text' step adds, or a viewer clip around an image/table);
+      - fill-only near-white rectangles: the background patches that erasing / moving text paints over
+        old content. Their EDGES used to be read as table borders, so after an edit a paragraph was
+        split along the patch (a box ending in the middle of a word).
+    Real borders are stroked ('s'/'fs') or dark / coloured, so they are kept."""
+    t = d.get("type")
+    if t == "clip":
+        return True
+    if t == "f":
+        fill = d.get("fill")
+        if isinstance(fill, (list, tuple)) and fill:
+            ch = fill[:3] if len(fill) >= 3 else fill[:1]
+            if min(ch) >= 0.93:
+                return True
+    return False
+
+
 def _extract_vector_primitives(
     page: fitz.Page,
 ) -> Tuple[List[Tuple[float, float, float, float, int]], List[Tuple[float, float, float, float]], List[Dict[str, Any]]]:
@@ -24,7 +43,7 @@ def _extract_vector_primitives(
 
     for d in drawings:
         rect = d.get("rect")
-        if rect is None:
+        if rect is None or _is_invisible_patch(d):
             continue
         rx0, ry0, rx1, ry1 = float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)
         w = rx1 - rx0

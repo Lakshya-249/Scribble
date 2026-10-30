@@ -6,7 +6,7 @@ import pymupdf as fitz
 
 from services.compiler import layout_run, draw_pieces, compute_empirical_width_scale, looks_right_aligned
 from services.diff_plan import plan_diff
-from services.erase_service import safe_erase, remove_underline, draw_underline
+from services.erase_service import safe_erase, remove_underlines, draw_underline
 from services.font_service import rgb
 from services.style_runs import Run, old_char_styles, new_char_styles, style_of, _group
 
@@ -48,8 +48,10 @@ def try_diff_edit(doc, page_num, block, new_text, all_blocks, cache, ghost):
         safe_erase(page, fitz.Rect(rect), fill_bg=False, ghost=ghost, cache=cache)
 
     # 2. move underlines: remove the exact old path, draw it again with the new extent and old colour
+    #    ALL old ones go first, then the new ones are drawn: removing one old underline must never be
+    #    able to touch a new one that was already drawn next to it.
+    remove_underlines(page, [old for old, _, _ in plan.underlines])
     for old, new, colour in plan.underlines:
-        remove_underline(page, old)
         if new is not None:
             draw_underline(page, new, rgb(colour))
 

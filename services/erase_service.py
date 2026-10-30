@@ -302,17 +302,65 @@ def _hairline_present(page: fitz.Page, x0: float, x1: float, ym: float) -> bool:
     return False
 
 
+def _underline_paths(drawings: list, x0: float, x1: float, ym: float) -> list:
+    """The vector path(s) that make up the underline [x0, x1] at height ym."""
+    out = []
+    for d in drawings:
+        r = d.get("rect")
+        if r is None or d.get("type") not in ("f", "s", "fs"):
+            continue
+        if (r.height <= 3.5 and r.width >= 2.0 and abs((r.y0 + r.y1) / 2 - ym) <= 1.5
+                and r.x0 >= x0 - 1.0 and r.x1 <= x1 + 1.0 and r.width >= 0.8 * (x1 - x0)):
+            out.append(d)
+    return out
+
+
+def remove_underlines(page: fitz.Page, rects: list) -> None:
+    """Get rid of several old underlines in ONE go. Always remove them all BEFORE drawing any new one:
+    the paint-over fallback of an old underline used to wipe the freshly drawn neighbour (the last
+    letters of 'GitHub' lost their underline).
+
+    1) delete the exact path, padded by its stroke width (a 1pt stroke is 0.5pt wider than its rect on
+       every side, so the old fixed 0.3pt pad left square-capped ends behind as stray stubs);
+    2) re-read the page; 3) only what survived is covered by a thin band (stroke tall, never a box)."""
+    if not rects:
+        return
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        drawings = []
+    todo = []                                    # (x0, x1, ym, [paths])
+    for (x0, y0, x1, y1) in rects:
+        ym = (y0 + y1) / 2.0
+        todo.append((x0, x1, ym, _underline_paths(drawings, x0, x1, ym)))
+
+    try:
+        for x0, x1, ym, paths in todo:
+            if paths:
+                for d in paths:
+                    pad = max(0.6, float(d.get("width") or 0.0) / 2.0 + 0.4)
+                    page.add_redact_annot(fitz.Rect(d["rect"]) + (-pad, -pad, pad, pad), fill=False)
+            else:
+                page.add_redact_annot(fitz.Rect(x0 - 0.8, ym - 0.9, x1 + 0.8, ym + 0.9), fill=False)
+        page.apply_redactions(images=0, graphics=1, text=fitz.PDF_REDACT_TEXT_NONE)
+    except (TypeError, AttributeError, ValueError):
+        for a in list(page.annots(types=[fitz.PDF_ANNOT_REDACT]) or []):
+            page.delete_annot(a)
+
+    try:
+        left = page.get_drawings()
+    except Exception:
+        return
+    for x0, x1, ym, paths in todo:
+        for d in _underline_paths(left, x0, x1, ym):
+            w = max(1.2, float(d.get("width") or 0.5) + 0.8)
+            band = fitz.Rect(x0 - 0.5, ym - w / 2, x1 + 0.5, ym + w / 2)
+            page.draw_rect(band, color=None, fill=sample_bg(page, band, pad=1.0), overlay=True)
+
+
 def remove_underline(page: fitz.Page, rect) -> None:
-    """Get rid of one old underline. Works for hairline strokes too (their rect has height 0).
-    1) delete exactly that path; 2) check it is really gone; 3) only if not, paint a band that is
-    just ~1pt tall over it (never the +-2pt box the old code used, which swallowed table borders)."""
-    x0, y0, x1, y1 = rect
-    ym = (y0 + y1) / 2.0
-    band = fitz.Rect(x0, ym - 0.6, x1, ym + 0.6)
-    remove_line_art(page, band)
-    if _hairline_present(page, x0, x1, ym):
-        thin = fitz.Rect(x0, ym - 0.45, x1, ym + 0.45)
-        page.draw_rect(thin, color=None, fill=sample_bg(page, thin, pad=1.0), overlay=True)
+    """Get rid of one old underline (see remove_underlines)."""
+    remove_underlines(page, [rect])
 
 
 def draw_underline(page: fitz.Page, rect, rgb_colour) -> None:
