@@ -15,6 +15,7 @@ from services import sessions
 from services.sessions import Session
 from services.page_geometry import extract_page_geometry
 from services.spatial_cluster import SpatialClusterer, ParagraphBlock
+from services.markers import find_markers, visible_right_edge
 from services.obj_reflow import TextReflowEngine
 from services.compiler import PDFCompiler, draw_text_with_glyph_fallback, compute_empirical_width_scale
 from services.erase_service import safe_erase
@@ -123,6 +124,21 @@ def _load(s: Session, path: str, ghost: dict):
 def restore_snapshot(s: Session):
     path, ghost = s.undo.pop()
     _load(s, path, ghost)
+
+
+def _char_widths(page, doc, block, new_text, w_scale, cache):
+    """Rendered width of every character of new_text in the style it will be drawn with."""
+    from services.compiler import layout_run
+    from services.style_runs import Run, old_char_styles, new_char_styles
+    styles = new_char_styles(block.text, old_char_styles(block), new_text)
+    memo, out = {}, []
+    for ch, st in zip(new_text, styles):
+        k = (ch, st)
+        if k not in memo:
+            pieces, _ = layout_run(page, doc, Run(ch, st), cache, width_scale=w_scale)
+            memo[k] = sum(p.width for p in pieces)
+        out.append(memo[k])
+    return out
 
 
 def blocks_for(s: Session, page_idx: int) -> List[ParagraphBlock]:
@@ -397,8 +413,12 @@ def _edit(s: Session, op: dict) -> dict:
                         alignment=target.alignment,
                         original_line_baselines=orig_baselines,
                         original_line_text_lefts=orig_text_lefts,
+                        markers=(find_markers(target) if target.alignment in ("left", "justify") else []),
+                        right_limit_x=(visible_right_edge(target) if target.alignment == "justify" else None),
+                        char_widths=_char_widths(page, doc, target, new_text, w_scale, s.cache),
                     )
 
+                log.warning("REFLOW ends=%s markers=%s", [ln.text.split()[-1] for ln in reflow.lines], find_markers(target))
                 report = PDFCompiler(doc, cache=s.cache).apply_edit_and_cascade(
                     page_num=page_num, target_block=target, reflow_res=reflow,
                     all_blocks=blocks, new_text=new_text, ghost=ghost)

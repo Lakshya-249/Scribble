@@ -69,6 +69,23 @@ def _dominant_style(styles: List[Style]) -> Style:
     return max(counts.items(), key=lambda kv: kv[1])[0]
 
 
+def _neighbour_style(old_text: str, old_styles: List[Style], i: int, dominant: Style) -> Style:
+    """Style for text typed at position i of the old text: like a word processor, it continues the
+    character before the caret; at the start of a word (blank before) it takes the style of the word it
+    joins. The block's dominant style is only the last resort. (Using it for every insertion turned the
+    inserted 'dre' of a bold 'hundred' into regular type.)"""
+    n = len(old_styles)
+    prev_ok = i > 0 and i - 1 < n and not old_text[i - 1].isspace()
+    next_ok = i < n and i < len(old_text) and not old_text[i].isspace()
+    if prev_ok:
+        return old_styles[i - 1]
+    if next_ok:
+        return old_styles[i]
+    if i > 0 and i - 1 < n:
+        return old_styles[i - 1]
+    return old_styles[i] if i < n else dominant
+
+
 def new_char_styles(old_text: str, old_styles: List[Style], new_text: str) -> List[Style]:
     """One Style per character of new_text (same length)."""
     if not old_styles:
@@ -89,7 +106,7 @@ def new_char_styles(old_text: str, old_styles: List[Style], new_text: str) -> Li
                     base_st = Style(base_st.font, base_st.flags, base_st.size, base_st.color, True)
                 out.append(base_st)
         elif tag == "insert":
-            st = dominant
+            st = _neighbour_style(old_text, old_styles, i1, dominant)
             if has_any_underline and not st.underline:
                 st = Style(st.font, st.flags, st.size, st.color, True)
             out.extend([st] * (j2 - j1))

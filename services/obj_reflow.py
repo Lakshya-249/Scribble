@@ -1,6 +1,9 @@
+import re
 import pymupdf as fitz
 from typing import List, Tuple, Optional, Callable
 from dataclasses import dataclass
+
+from services.markers import match_marker
 
 
 @dataclass
@@ -67,6 +70,9 @@ class TextReflowEngine:
         alignment: str = "left",
         original_line_baselines: Optional[List[float]] = None,
         original_line_text_lefts: Optional[List[float]] = None,
+        markers: Optional[list] = None,
+        right_limit_x: Optional[float] = None,
+        char_widths: Optional[List[float]] = None,
     ) -> ReflowResult:
         x0, y0, x1, y1 = original_bbox
         original_width = x1 - x0
@@ -76,33 +82,58 @@ class TextReflowEngine:
             # the paragraph was already wrapped by the PDF: keep ITS right edge instead of the wider
             # container, otherwise edited lines run past the original margin
             max_allowed_width = original_width
+        if right_limit_x is not None:
+            # the VISIBLE right margin (last visible glyph), not the bbox that includes a trailing blank
+            max_allowed_width = right_limit_x - x0
 
-        paragraphs_or_lines = new_text.split("\n")
-        final_lines: List[Tuple[str, bool, bool]] = []
+        def marker_extra(text: str) -> float:
+            # a marker line is drawn as marker + COLUMN GAP + body, but measured as "marker<one blank>body":
+            # add the difference so wrapping decisions match what will really be drawn
+            m = match_marker(markers or [], text)
+            if m is None:
+                return 0.0
+            return max(0.0, (m.body_x - m.x) - self.measure_text_width(m.text + " "))
 
-        for segment in paragraphs_or_lines:
-            words = [w for w in segment.split(" ") if w]
+        space_w = self.measure_text_width(" ")
+
+        def words_w(ws) -> float:
+            """width of [(word, offset in new_text)] joined by single blanks. With char_widths every glyph is
+            measured in ITS OWN style (bold is wider than the regular font the engine was built with)."""
+            if char_widths is None or len(char_widths) < len(new_text):
+                return self.measure_text_width(" ".join(w for w, _ in ws))
+            return sum(sum(char_widths[p:p + len(w)]) for w, p in ws) + space_w * (len(ws) - 1)
+
+        final_lines: List[Tuple[str, bool, bool, float]] = []
+        base = 0
+        for segment in new_text.split("\n"):
+            words = [(m.group(), base + m.start()) for m in re.finditer(r"[^ ]+", segment)]
+            base += len(segment) + 1
             if not words:
-                final_lines.append(("", True, True))
+                final_lines.append(("", True, True, 0.0))
                 continue
 
-            current_line: List[str] = []
+            current_line: list = []
+            cur_w = 0.0
             is_first = True
             for word in words:
-                test_line = " ".join(current_line + [word]) if current_line else word
-                line_w = self.measure_text_width(test_line)
+                test = current_line + [word]
+                line_w = words_w(test)
+                text_w = " ".join(w for w, _ in test)
+                line_w += marker_extra(text_w)
                 left_offset = first_line_indent if is_first else hanging_indent
                 line_limit = max_allowed_width - left_offset
 
                 if line_w <= (line_limit + 1.5) or not current_line:
                     current_line.append(word)
+                    cur_w = line_w
                 else:
-                    final_lines.append((" ".join(current_line), False, is_first))
+                    final_lines.append((" ".join(w for w, _ in current_line), False, is_first, cur_w))
                     current_line = [word]
+                    cur_w = words_w(current_line)
                     is_first = False
 
             if current_line:
-                final_lines.append((" ".join(current_line), True, is_first))
+                final_lines.append((" ".join(w for w, _ in current_line), True, is_first, cur_w))
 
         reflowed_lines: List[ReflowedLine] = []
         current_y = initial_baseline_y
@@ -115,7 +146,7 @@ class TextReflowEngine:
         # had one, else under the text after the bullet / first-line indent
         cont_left = lefts[1] if len(lefts) > 1 else left0 + hanging_indent - first_line_indent
 
-        for idx, (line_str, is_last, is_first) in enumerate(final_lines):
+        for idx, (line_str, is_last, is_first, line_w_known) in enumerate(final_lines):
             # original_line_text_lefts are the REAL left edges of the old lines (a bullet line starts at
             # its bullet, and the bullet is part of the text we redraw), so no extra indent is added there.
             if idx < n_orig:
@@ -128,7 +159,7 @@ class TextReflowEngine:
                 # same left edge); only a soft-wrapped continuation is indented.
                 line_x0 = left0 if is_first else cont_left
             indent = 0.0
-            line_w = self.measure_text_width(line_str) if line_str else 0.0
+            line_w = line_w_known if line_str else 0.0
             target_w = max(0.0, original_width - indent)
 
             if alignment == "center" and original_width > line_w:

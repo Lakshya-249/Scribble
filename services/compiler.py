@@ -5,6 +5,7 @@ from typing import List, Tuple, Optional
 
 from services.spatial_cluster import ParagraphBlock, BULLET_CHARS
 from services.obj_reflow import ReflowResult
+from services.markers import find_markers, visible_right_edge, place_line, split_marker
 from services.erase_service import (safe_erase, erase_underline_rect, remove_underline, draw_underline,
                                     collect_drawings_below, remove_drawings_verified, redraw_drawings)
 from services.font_service import (
@@ -232,20 +233,23 @@ class PDFCompiler:
         cursor = 0
         is_justified = getattr(target_block, "alignment", "left") == "justify"
 
-        # The old bullet->text gap (wide in many PDFs). Re-typesetting "● text" with one space would collapse it.
-        cols = _bullet_cols(target_block) if getattr(target_block, "alignment", "left") == "left" else None
+        # Marker -> body gap (bullets, 'a)', '1.', '(iv)' ...). Re-typesetting "a) text" with one blank would
+        # collapse the original column, so marker and body go to the columns of the ORIGINAL glyphs.
+        # Works for justified text too: only the body is justified, from where it really starts, to the
+        # VISIBLE right margin.
+        align = getattr(target_block, "alignment", "left")
+        marks = find_markers(target_block) if align in ("left", "justify") else []
+        edge = visible_right_edge(target_block) if is_justified else None
 
         for line in reflow_res.lines:
             runs, cursor = line_runs(line.text, new_text, new_styles, cursor, default)
-            just_w = line.target_width if (is_justified and not line.is_last_in_para) else 0.0
             lx, ly = line.baseline_origin
-            if cols and line.text[:1] in BULLET_CHARS and runs and len(runs[0].text) >= 1:
-                # bullet and text go to the ORIGINAL columns (taken from the old glyphs), bullet never underlined
-                first = runs[0]
-                bst = dataclasses.replace(first.style, underline=False)
-                bullet_run = Run(first.text[0], bst)
-                rest = [Run(first.text[1:], first.style)] + list(runs[1:])
-                # drop every leading blank (it may sit in a later run when the bullet is styled differently)
+            pl = place_line(marks, edge, is_justified, line.text, lx, line.target_width, line.is_last_in_para)
+            if pl.marker is not None and runs:
+                mk_runs, rest = split_marker(runs, len(pl.marker.text))
+                if pl.marker.glyph:                      # a bullet symbol is never underlined
+                    mk_runs = [Run(r.text, dataclasses.replace(r.style, underline=False)) for r in mk_runs]
+                # drop every leading blank (it may sit in a later run when the marker is styled differently)
                 while rest:
                     t = rest[0].text
                     k = 0
@@ -257,13 +261,13 @@ class PDFCompiler:
                         rest[0] = Run(t[k:], rest[0].style)
                         break
                     rest.pop(0)
-                plan.append(self._plan_line(page, cols[0], ly, [bullet_run], report, width_scale=width_scale))
-                plan.append(self._plan_line(page, cols[1], ly, rest, report,
-                                            width_scale=width_scale, justify_target_w=just_w))
+                plan.append(self._plan_line(page, pl.marker.x, ly, mk_runs, report, width_scale=width_scale))
+                plan.append(self._plan_line(page, pl.body_x, ly, rest, report,
+                                            width_scale=width_scale, justify_target_w=pl.just_w))
                 continue
             plan.append(
                 self._plan_line(page, lx, ly, runs, report,
-                                width_scale=width_scale, justify_target_w=just_w)
+                                width_scale=width_scale, justify_target_w=pl.just_w)
             )
 
         if (len(plan) == 1 and len(target_block.lines) == 1
