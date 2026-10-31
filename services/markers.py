@@ -47,42 +47,121 @@ def _visible(line) -> list:
     return toks
 
 
+
 def _marker_of_line(toks: list, siblings_left: List[float]) -> Optional[Marker]:
     if len(toks) < 2:
         return None
+
     first = toks[0]
     size = max(float(first.font_size), 1.0)
 
-    # glyph bullets: '•' ... and '-', '–' ... when followed by a gap
+    # ---------------------------------------------------------
+    # 1. Glyph bullets
+    # ---------------------------------------------------------
     if first.char in BULLET_CHARS or first.char in _PUA_BULLETS:
-        body = next((t for t in toks[1:] if t.char not in BULLET_CHARS and t.char not in _PUA_BULLETS
-                     and t.bbox[0] >= first.bbox[2] - 0.5
-                     and abs(t.origin[1] - first.origin[1]) < size * 0.8), None)
+        body = next((
+            t for t in toks[1:]
+            if t.char not in BULLET_CHARS
+            and t.char not in _PUA_BULLETS
+            and t.bbox[0] >= first.bbox[2] - 0.5
+            and abs(t.origin[1] - first.origin[1]) < size * 0.8
+        ), None)
+
         if body is None:
             return None
+
         gap = body.bbox[0] - first.bbox[2]
-        if first.char in _GLYPH_BULLETS or first.char in _PUA_BULLETS or gap >= BULLET_GAP_EM * size:
-            return Marker(first.char, float(first.origin[0]), float(body.origin[0]), glyph=True)
+
+        if (first.char in _GLYPH_BULLETS
+                or first.char in _PUA_BULLETS
+                or gap >= BULLET_GAP_EM * size):
+            return Marker(
+                first.char,
+                float(first.origin[0]),
+                float(body.origin[0]),
+                glyph=True
+            )
         return None
 
-    group = [first]
-    body = None
-    for t in toks[1:]:
+    # ---------------------------------------------------------
+    # 2. Existing large-gap detection
+    # ---------------------------------------------------------
+    group = []
+
+    for i, t in enumerate(toks[1:], start=1):
         if abs(t.origin[1] - first.origin[1]) >= size * 0.8:
-            return None
-        if t.bbox[0] - group[-1].bbox[2] > GAP_EM * size:
-            body = t
             break
+
+        if t.bbox[0] - toks[i - 1].bbox[2] > GAP_EM * size:
+            text = "".join(g.char for g in toks[:i])
+
+            if len(text) > MAX_MARKER_CHARS:
+                break
+
+            body = t
+            aligned = any(
+                abs(l - body.bbox[0]) <= ALIGN_TOL
+                for l in siblings_left
+            )
+
+            if aligned or _is_list_number(text):
+                return Marker(
+                    text,
+                    float(first.origin[0]),
+                    float(body.origin[0])
+                )
+
+            break
+
         group.append(t)
-        if len(group) > MAX_MARKER_CHARS:
-            return None
-    if body is None:
-        return None
-    text = "".join(t.char for t in group)
-    body_x = float(body.origin[0])
-    aligned = any(abs(l - body.bbox[0]) <= ALIGN_TOL for l in siblings_left)
-    if aligned or _is_list_number(text):
-        return Marker(text, float(first.origin[0]), body_x)
+
+    # ---------------------------------------------------------
+    # 3. NEW: Hanging-indent detection
+    # ---------------------------------------------------------
+    # Do not require a large marker/body gap.
+    # Instead, find a short prefix whose following glyph
+    # aligns with the beginning of another paragraph line.
+
+    max_prefix = min(MAX_MARKER_CHARS, len(toks) - 1)
+
+    for i in range(max_prefix, 0, -1):
+        prefix = toks[:i]
+        body = toks[i]
+
+        # All marker glyphs must be on the same baseline.
+        if any(
+            abs(t.origin[1] - first.origin[1]) >= size * 0.8
+            for t in prefix
+        ):
+            continue
+
+        # Marker glyphs must form a compact sequence.
+        compact = all(
+            prefix[j].bbox[0] - prefix[j - 1].bbox[2]
+            <= 0.35 * size
+            for j in range(1, len(prefix))
+        )
+
+        if not compact:
+            continue
+
+        # Body must align with a wrapped/sibling line.
+        aligned = any(
+            abs(l - body.bbox[0]) <= ALIGN_TOL
+            for l in siblings_left
+        )
+
+        if not aligned:
+            continue
+
+        text = "".join(t.char for t in prefix)
+
+        return Marker(
+            text,
+            float(first.origin[0]),
+            float(body.origin[0])
+        )
+
     return None
 
 
