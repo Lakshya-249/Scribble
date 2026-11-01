@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+import traceback
 from typing import List, Optional
 from urllib.parse import quote
 
@@ -354,7 +355,7 @@ def _edit(s: Session, op: dict) -> dict:
             _bad("Invalid page number")
         if op_type == "line" and (not isinstance(op.get("new", ""), str) or len(op.get("new", "")) > 20000):
             _bad("That text is too long.")
-        if op_type == "line" and op.get("old", "") == op.get("new", ""):
+        if op_type == "line" and op.get("old", "") == op.get("new", "") and not op.get("marks"):
             return state(s, unchanged=True, missing="", note="")
 
         page = doc[page_num]
@@ -364,18 +365,21 @@ def _edit(s: Session, op: dict) -> dict:
 
             if op_type == "line":
                 new_text = op.get("new", "")
+                from services.style_runs import clean_marks
+                marks = clean_marks(op.get("marks"), len(new_text))
                 blocks = s.blocks.get(page_num) or blocks_for(s, page_num)
                 target = find_target_block(blocks, op)
                 if target is None:
                     raise LookupError("That text moved or changed. Reload the page and try again.")
 
                 # 1) minimal-diff edit: unchanged glyphs, borders and underlines are never touched
-                rep = try_diff_edit(doc, page_num, target, new_text, blocks, s.cache, ghost)
+                rep = None if marks else try_diff_edit(doc, page_num, target, new_text, blocks, s.cache, ghost)
                 if rep is not None:
                     changed(s)
                     return state(s, missing=rep["substituted"], note="Edit applied")
 
                 # 2) fallback: re-typeset the paragraph
+                inplace = bool(marks) and new_text == target.text     # style change only: keep every line break
                 first_baseline = target.lines[0].baseline_y if target.lines else target.bbox[1] + 10.0
                 size = target.lines[0].dominant_font_size if target.lines else 11.0
                 first_tok = target.lines[0].tokens[0] if (target.lines and target.lines[0].tokens) else None
@@ -390,7 +394,15 @@ def _edit(s: Session, op: dict) -> dict:
                     return primary_font.text_length(txt, fontsize=size) * w_scale
 
                 max_single_w = (target.container_max_x1 - target.bbox[0]) if target.container_max_x1 else (target.bbox[2] - target.bbox[0])
-                if (len(target.lines) == 1
+                if inplace:
+                    from services.obj_reflow import ReflowedLine, ReflowResult
+                    nl = len(target.lines)
+                    reflow = ReflowResult(
+                        lines=[ReflowedLine(text=ln.text, baseline_origin=(ln.bbox[0], ln.baseline_y), bbox=tuple(ln.bbox),
+                                            width=ln.bbox[2] - ln.bbox[0], is_last_in_para=(k == nl - 1),
+                                            target_width=ln.bbox[2] - ln.bbox[0]) for k, ln in enumerate(target.lines)],
+                        total_bbox=tuple(target.bbox), height_delta=0.0)
+                elif (len(target.lines) == 1
                         and "\n" not in new_text
                         and _measure(new_text) <= max(max_single_w, target.bbox[2] - target.bbox[0]) + 15.0):
                     reflow = TextReflowEngine.single_line(new_text, target.bbox, first_baseline)
@@ -418,10 +430,10 @@ def _edit(s: Session, op: dict) -> dict:
                         char_widths=_char_widths(page, doc, target, new_text, w_scale, s.cache),
                     )
 
-                log.warning("REFLOW ends=%s markers=%s", [ln.text.split()[-1] for ln in reflow.lines], find_markers(target))
+                log.warning("REFLOW ends=%s markers=%s", [(ln.text.split() or [""])[-1] for ln in reflow.lines], find_markers(target))
                 report = PDFCompiler(doc, cache=s.cache).apply_edit_and_cascade(
                     page_num=page_num, target_block=target, reflow_res=reflow,
-                    all_blocks=blocks, new_text=new_text, ghost=ghost)
+                    all_blocks=blocks, new_text=new_text, ghost=ghost, marks=marks)
                 changed(s)
                 return state(s, missing=report["substituted"], note="Edit applied")
 
@@ -466,6 +478,8 @@ def _edit(s: Session, op: dict) -> dict:
             raise
         except (LookupError, ValueError) as e:       # problems the user can act on
             restore_snapshot(s)
+            error_stack = traceback.format_exc()
+            print(error_stack)
             raise HTTPException(status_code=422, detail=str(e))
         except Exception:
             log.exception("edit failed (type=%s)", op_type)

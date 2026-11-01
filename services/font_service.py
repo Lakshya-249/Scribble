@@ -11,7 +11,7 @@ _SYS_LOCK = threading.Lock()
 
 def new_cache() -> dict:
     """Font caches belong to ONE session/document to avoid leaking font bindings."""
-    return {"fonts": {}, "emb": set(), "fname": {}, "same": {}, "synth": set()}
+    return {"fonts": {}, "emb": set(), "fname": {}, "same": {}, "synth": set(), "synth_i": set()}
 
 
 def reset_cache(cache: dict):
@@ -20,6 +20,7 @@ def reset_cache(cache: dict):
     cache["fname"].clear()
     cache.setdefault("same", {}).clear()
     cache.setdefault("synth", set()).clear()
+    cache.setdefault("synth_i", set()).clear()
 
 
 _DEFAULT_CACHE = new_cache()
@@ -155,6 +156,10 @@ def is_bold_file(path: str) -> bool:
     return split_style(os.path.splitext(os.path.basename(path))[0])[1]
 
 
+def is_italic_file(path: str) -> bool:
+    return split_style(os.path.splitext(os.path.basename(path))[0])[2]
+
+
 _SANS_HINT = re.compile(
     r"ubuntu|arial|helvet|calibri|roboto|open ?sans|segoe|verdana|tahoma|lato|inter|poppins|"
     r"montserrat|nunito|noto ?sans|source ?sans|dejavu ?sans|liberation ?sans|sans|gothic|mukta|hind"
@@ -215,6 +220,9 @@ def font_chain(doc: fitz.Document, page: fitz.Page, fname: str, flags: int, cach
                     wants_bold = split_style(fname)[1] or bool(flags & 16)
                     if wants_bold and not is_bold_file(p):
                         cache.setdefault("synth", set()).add(id(fo))   # fake it when drawing
+                    wants_italic = split_style(fname)[2] or bool(flags & 2)
+                    if wants_italic and not is_italic_file(p):
+                        cache.setdefault("synth_i", set()).add(id(fo))  # no italic file installed: slant it
         except Exception:
             pass
 

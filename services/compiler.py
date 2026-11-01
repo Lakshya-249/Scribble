@@ -122,11 +122,14 @@ def draw_pieces(page, x, y, pieces, st: Style, fallback_code, cache, extra_space
         res_name = register_font_name(page, pc.ent, fallback_code=fallback_code, cache=cache)
         if pc.text != " ":
             try:
+                kw = {}
+                if id(pc.ent[0]) in cache.get("synth_i", ()):
+                    kw["morph"] = (fitz.Point(x, y), fitz.Matrix(1, 0, -0.2, 1, 0, 0))   # ~11 degree slant about the baseline
                 if id(pc.ent[0]) in cache.get("synth", ()):
                     page.insert_text((x, y), pc.text, fontname=res_name, fontsize=st.size,
-                                     color=color, render_mode=2, border_width=0.03)
+                                     color=color, render_mode=2, border_width=0.03, **kw)
                 else:
-                    page.insert_text((x, y), pc.text, fontname=res_name, fontsize=st.size, color=color)
+                    page.insert_text((x, y), pc.text, fontname=res_name, fontsize=st.size, color=color, **kw)
             except Exception:
                 page.insert_text((x, y), pc.text, fontname=fallback_code, fontsize=st.size, color=color)
         x += pc.width
@@ -191,6 +194,12 @@ class PDFCompiler:
             if diff <= max(35.0, justify_target_w * 0.22):
                 extra_space_w = diff / space_count
                 total += diff
+        elif justify_target_w and total > justify_target_w and space_count > 0:
+            over = total - justify_target_w                       # e.g. a bold word made the line wider
+            space_total = sum(p.width for _, pcs, _ in planned for p in pcs if p.text == " ")
+            if over <= 0.6 * space_total:
+                extra_space_w = -over / space_count
+                total -= over
 
         return [x, y, planned, total, extra_space_w]
 
@@ -202,6 +211,7 @@ class PDFCompiler:
         all_blocks: List[ParagraphBlock],
         new_text: Optional[str] = None,
         ghost: Optional[list] = None,
+        marks: Optional[list] = None,
     ) -> dict:
         page = self.doc.load_page(page_num)
         height_delta = reflow_res.height_delta
@@ -227,6 +237,9 @@ class PDFCompiler:
             new_text = "\n".join(ln.text for ln in reflow_res.lines)
         old_styles = old_char_styles(target_block)
         new_styles = new_char_styles(target_block.text, old_styles, new_text)
+        if marks:
+            from services.style_runs import apply_marks
+            new_styles = apply_marks(new_styles, marks)
         default = old_styles[0] if old_styles else DEFAULT_STYLE
 
         plan = []

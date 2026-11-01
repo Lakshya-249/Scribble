@@ -761,6 +761,42 @@ dialog .btn.fill { color: white; border-color: var(--accent); }
 #expired.show { display: flex; }
 #expired .btn { color: white; height: 32px; }
 
+/* ─── Text formatting bar (editing existing text) ───── */
+.fmtbar {
+  position: absolute; z-index: 52; display: flex; align-items: center; gap: 2px; padding: 4px;
+  background: var(--dark); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.3); animation: slideDown .16s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.fb {
+  min-width: 30px; height: 30px; padding: 0 8px; border: 0; border-radius: 7px;
+  background: transparent; color: #d9d4c8; font: 600 13px/1 "Plus Jakarta Sans", sans-serif;
+  transition: background .12s, color .12s;
+}
+.fb:hover { background: rgba(255,255,255,0.08); color: #fff; }
+.fb.on { background: var(--dark-3); color: var(--accent-bright); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12); }
+.fb.txt { font: 500 11.5px/1 "Plus Jakarta Sans", sans-serif; color: #9e998e; }
+.fb em { font-family: "Instrument Serif", Georgia, serif; font-size: 17px; font-weight: 400; }
+.fsep { width: 1px; height: 18px; background: rgba(255,255,255,0.1); margin: 0 4px; flex: none; }
+.fsize {
+  width: 54px; height: 28px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px;
+  background: var(--dark-2); color: #f4f0e8; text-align: center; font: 500 12px "JetBrains Mono", monospace;
+}
+.fsize:focus { outline: none; border-color: var(--accent); }
+.fcol {
+  width: 26px; height: 26px; padding: 0; margin: 0 3px; border: 2px solid rgba(255,255,255,0.28);
+  border-radius: 50%; background: none; cursor: pointer;
+}
+.fmtprev {
+  position: absolute; z-index: 51; padding: 10px 12px 11px; background: var(--surface-2);
+  border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: var(--shadow);
+  white-space: pre-wrap; overflow-wrap: break-word; line-height: 1.35; color: var(--ink);
+}
+.fmtprev[hidden] { display: none; }
+.fmtprev::before {
+  content: "PREVIEW"; display: block; margin-bottom: 6px; color: var(--muted);
+  font: 500 9.5px/1 "JetBrains Mono", monospace; letter-spacing: .14em;
+}
+
 /* ─── Responsive Adjustments ─────────────────────────── */
 
 @media (max-width: 1120px) {
@@ -1628,6 +1664,129 @@ const rgbCss = c => c
   ? `rgb(${(c >> 16) & 255},${(c >> 8) & 255},${c & 255})`
   : "#111827";
 
+/* ============================== formatting for the paragraph being edited ============================== */
+
+function fmtBar(wrap, ta, block, x0, y0) {
+  const marks = [];
+  const base = {
+    b: !!((block.flags & 16) || /bold|black|heavy|semibold/i.test(block.font || "")),
+    i: !!((block.flags & 2) || /italic|oblique/i.test(block.font || "")),
+    u: false, c: block.color || 0, z: block.size || 11
+  };
+  const hex = c => "#" + ((c >>> 0) & 0xFFFFFF).toString(16).padStart(6, "0");
+  let prev = ta.value;
+
+  // effective style of character k = block style + every mark that covers it (later marks win)
+  const eff = k => {
+    const o = { ...base };
+    for (const m of marks) if (k >= m.s && k < m.e) for (const p of "biucz") if (p in m) o[p] = m[p];
+    return o;
+  };
+  // the selection; with nothing selected the whole paragraph is meant
+  const sel = () => {
+    let s = ta.selectionStart, e = ta.selectionEnd;
+    if (s === e) { s = 0; e = ta.value.length; }
+    return [s, e];
+  };
+
+  const pv = el("div", { class: "fmtprev" });
+  pv.hidden = true;
+
+  const render = () => {
+    pv.replaceChildren();
+    pv.hidden = !marks.length;
+    if (!marks.length) return;
+    pv.style.left = `calc(var(--s)*${x0}px)`;
+    pv.style.top = (ta.offsetTop + ta.offsetHeight + 10) + "px";
+    pv.style.width = ta.offsetWidth + "px";
+    let run = "", key = "", st = null;
+    const flush = () => {
+      if (!run) return;
+      const sp = el("span");
+      sp.textContent = run;
+      Object.assign(sp.style, {
+        fontWeight: st.b ? 700 : 400, fontStyle: st.i ? "italic" : "normal",
+        textDecoration: st.u ? "underline" : "none", color: rgbCss(st.c),
+        fontSize: `calc(var(--s)*${st.z}px)`
+      });
+      pv.append(sp); run = "";
+    };
+    for (let k = 0; k < ta.value.length; k++) {
+      const e = eff(k), kk = JSON.stringify(e);
+      if (kk !== key) { flush(); key = kk; st = e; }
+      run += ta.value[k];
+    }
+    flush();
+  };
+
+  const bB = el("button", { class: "fb", type: "button", title: "Bold (Ctrl+B)" }, el("b", {}, "B"));
+  const bI = el("button", { class: "fb", type: "button", title: "Italic (Ctrl+I)" }, el("em", {}, "I"));
+  const bU = el("button", { class: "fb", type: "button", title: "Underline (Ctrl+U)" }, el("u", {}, "U"));
+  const bMinus = el("button", { class: "fb", type: "button", title: "Smaller" }, "A\u2212");
+  const bPlus = el("button", { class: "fb", type: "button", title: "Larger" }, "A+");
+  const size = el("input", { class: "fsize", type: "number", min: 4, max: 200, step: 0.5, title: "Font size (pt)", value: base.z });
+  const col = el("input", { class: "fcol", type: "color", title: "Text colour", value: hex(base.c) });
+  const bReset = el("button", { class: "fb txt", type: "button", title: "Remove all formatting you added" }, "Reset");
+
+  // show the state at the caret on the buttons
+  const sync = () => {
+    const at = clamp(ta.selectionStart, 0, Math.max(0, ta.value.length - 1)), e = eff(at);
+    bB.classList.toggle("on", e.b); bI.classList.toggle("on", e.i); bU.classList.toggle("on", e.u);
+    if (document.activeElement !== size) size.value = Math.round(e.z * 10) / 10;
+    col.value = hex(e.c);
+  };
+
+  const add = m => {
+    const s0 = ta.selectionStart, e0 = ta.selectionEnd;
+    marks.push(m); render(); ta.focus(); ta.setSelectionRange(s0, e0); sync();
+  };
+  const toggle = p => {
+    const [s, e] = sel();
+    const all = Array.from({ length: e - s }, (_, j) => eff(s + j)[p]).every(Boolean);
+    add({ s, e, [p]: !all });
+  };
+  const setSize = z => { const [s, e] = sel(); if (z >= 4 && z <= 200) add({ s, e, z: Math.round(z * 2) / 2 }); };
+
+  bB.onclick = () => toggle("b"); bI.onclick = () => toggle("i"); bU.onclick = () => toggle("u");
+  bMinus.onclick = () => { const [s] = sel(); setSize(eff(s).z - 1); };
+  bPlus.onclick = () => { const [s] = sel(); setSize(eff(s).z + 1); };
+  size.onchange = () => setSize(parseFloat(size.value));
+  col.oninput = () => { const [s, e] = sel(); marks.push({ s, e, c: parseInt(col.value.slice(1), 16) }); render(); };
+  bReset.onclick = () => { marks.length = 0; render(); ta.focus(); sync(); };
+
+  const bar = el("div", {
+    class: "fmtbar",
+    style: `left:calc(var(--s)*${x0}px);top:max(36px,calc(var(--s)*${y0}px - 74px))`
+  }, bB, bI, bU, el("span", { class: "fsep" }), bMinus, size, bPlus, el("span", { class: "fsep" }), col,
+     el("span", { class: "fsep" }), bReset);
+
+  // keep the text selection when a bar button is pressed (not for the inputs, they need focus)
+  bar.addEventListener("mousedown", e => { if (!/^(INPUT|SELECT)$/.test(e.target.tagName)) e.preventDefault(); });
+
+  ta.addEventListener("keydown", e => {
+    const k = e.key.toLowerCase();
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (k === "b" || k === "i" || k === "u")) {
+      e.preventDefault(); toggle(k);
+    }
+  });
+  ["keyup", "mouseup", "select", "focus"].forEach(t => ta.addEventListener(t, sync));
+
+  // typing / deleting moves the formatted ranges along with the text
+  ta.addEventListener("input", () => {
+    const v = ta.value, o = prev, mx = Math.min(o.length, v.length);
+    let p = 0, q = 0;
+    while (p < mx && o[p] === v[p]) p++;
+    while (q < mx - p && o[o.length - 1 - q] === v[v.length - 1 - q]) q++;
+    const d = v.length - o.length, hi = o.length - q, ins = v.length - q - p;
+    const adj = x => x <= p ? x : x >= hi ? x + d : p + Math.max(0, Math.min(x - p, ins));
+    for (const m of marks) { m.s = adj(m.s); m.e = adj(m.e); }
+    for (let k = marks.length - 1; k >= 0; k--) if (marks[k].e <= marks[k].s) marks.splice(k, 1);
+    prev = v; render(); sync();
+  });
+
+  return { bar, pv, marks, render, sync };
+}
+
 function openBlockEditor(wrap, pageIdx, block) {
   closeEditor(true);
 
@@ -1693,12 +1852,15 @@ function openBlockEditor(wrap, pageIdx, block) {
     }
   });
 
-  wrap.append(ta, hint);
+  const fmt = fmtBar(wrap, ta, block, x0, y0);
+  wrap.append(ta, hint, fmt.bar, fmt.pv);
   grow();
+  fmt.render();
+  fmt.sync();
   ta.focus();
   ta.setSelectionRange(ta.value.length, ta.value.length);
 
-  S.editor = { kind: "line", ta, hint, pageIdx, block };
+  S.editor = { kind: "line", ta, hint, pageIdx, block, fmt };
 }
 
 function openAddEditor(wrap, pageIdx, x, y) {
@@ -1765,21 +1927,23 @@ function closeEditor(commit) {
 
   S.editor = null;
   const val = ed.ta.value;
+  const marks = ed.fmt ? ed.fmt.marks.slice() : [];
 
   ed.ta.remove();
   ed.hint.remove();
+  if (ed.fmt) { ed.fmt.bar.remove(); ed.fmt.pv.remove(); }
 
   if (!commit) return;
 
-  if (ed.kind === "line" && val !== ed.block.text)
-    submitLine(ed.pageIdx, ed.block, val);
+  if (ed.kind === "line" && (val !== ed.block.text || marks.length))
+    submitLine(ed.pageIdx, ed.block, val, marks);
 
   if (ed.kind === "add" && val.trim())
     submitAdd(ed, val);
 }
 
 document.addEventListener("pointerdown", e => {
-  if (S.editor && !S.editor.ta.contains(e.target)) closeEditor(true);
+  if (S.editor && !S.editor.ta.contains(e.target) && !e.target.closest(".fmtbar, .fmtprev")) closeEditor(true);
 }, true);
 
 function reportMissing(r) {
@@ -1787,7 +1951,7 @@ function reportMissing(r) {
     toast(`Applied. A similar font was used for: ${r.missing}`, { kind: "warn", ms: 7000 });
 }
 
-function submitLine(pageIdx, block, newText) {
+function submitLine(pageIdx, block, newText, marks) {
   return mutate(async () => {
     try {
       const r = await post("/edit", {
@@ -1796,7 +1960,8 @@ function submitLine(pageIdx, block, newText) {
         block_id: block.id,
         bbox: block.bbox,
         old: block.text,
-        new: newText
+        new: newText,
+        marks: marks && marks.length ? marks : undefined
       });
 
       applyState(r);

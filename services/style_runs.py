@@ -133,3 +133,57 @@ def line_runs(line_text: str, full_text: str, styles: List[Style], cursor: int,
     if k < 0 or k + len(line_text) > len(styles):
         return [Run(line_text, styles[0] if styles else default)], cursor
     return _group(line_text, styles[k:k + len(line_text)]), k + len(line_text)
+
+
+# ---- user formatting (bold / italic / underline / colour / size) on ranges of the edited text
+import re as _re
+
+
+def clean_marks(raw, n: int) -> list:
+    out = []
+    for m in (raw or [])[:300]:
+        try:
+            a, b = max(0, int(m["s"])), min(n, int(m["e"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if b <= a:
+            continue
+        mm = {"s": a, "e": b}
+        for k in ("b", "i", "u"):
+            if isinstance(m.get(k), bool):
+                mm[k] = m[k]
+        if isinstance(m.get("c"), int) and not isinstance(m.get("c"), bool) and 0 <= m["c"] <= 0xFFFFFF:
+            mm["c"] = m["c"]
+        if isinstance(m.get("z"), (int, float)) and not isinstance(m.get("z"), bool):
+            mm["z"] = round(min(200.0, max(4.0, float(m["z"]))), 2)
+        out.append(mm)
+    return out
+
+
+def _fmt(st, m: dict):
+    """Apply one user mark to a Style.
+
+    The FLAGS alone are not enough: font_chain() finds the PDF's embedded font by NAME and uses it before it ever
+    looks at the flags, so "bold" on text whose embedded font is the regular face changed nothing (same for
+    italic). When bold / italic really changes, the font is therefore RENAMED to "<family>-Bold[Italic]": that
+    stops the embedded regular subset from matching and makes the lookup pick the real bold / italic file."""
+    from services.font_service import split_style
+    fam, name_b, name_i, _w = split_style(st.font)
+    cur_b, cur_i = bool(st.flags & 16) or name_b, bool(st.flags & 2) or name_i
+    want_b = bool(m["b"]) if "b" in m else cur_b
+    want_i = bool(m["i"]) if "i" in m else cur_i
+    font, flags = st.font, st.flags
+    if want_b != cur_b or want_i != cur_i:
+        tail = ("Bold" if want_b else "") + ("Italic" if want_i else "")
+        font = f"{fam}-{tail}" if (tail and fam) else (fam or st.font)
+    flags = (flags | 16) if want_b else (flags & ~16)
+    flags = (flags | 2) if want_i else (flags & ~2)
+    return Style(font, flags, m.get("z", st.size), m.get("c", st.color), m.get("u", st.underline))
+
+
+def apply_marks(styles, marks: list):
+    out = list(styles)
+    for m in marks:
+        for k in range(m["s"], min(m["e"], len(out))):
+            out[k] = _fmt(out[k], m)
+    return out
