@@ -277,7 +277,11 @@ def get_page_image(page_idx: int, request: Request, s: float = 1.6):
         else:
             sess.render.move_to_end(key)
         return Response(content=hit[0], media_type=hit[1],
-                        headers={"Cache-Control": "private, max-age=86400"})
+                        headers={
+                                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                                "Pragma": "no-cache",
+                                "Expires": "0",
+                        })
 
 
 @router.get("/text/{page_idx}")

@@ -110,6 +110,14 @@ def sys_fonts():
 # Commercial / unavailable font family -> free look-alikes, tried in order. These are
 # metric-compatible (same letter widths), so a substituted edit keeps the layout.
 ALIASES = {
+    # TeX / Computer Modern / Nimbus families
+    "cmr": ["texgyretermes", "liberationserif", "notoserif"],
+    "cmr10": ["texgyretermes", "liberationserif", "notoserif"],
+    "cmbx": ["texgyretermes", "liberationserif", "notoserif"],
+    "cmti": ["texgyretermes", "liberationserif", "notoserif"],
+    "nimbusroman": ["texgyretermes", "liberationserif", "notoserif"],
+    "nimbusromno9l": ["texgyretermes", "liberationserif", "notoserif"],
+
     "franklingothic": ["librefranklin", "notosans", "liberationsans"],
     "arial": ["liberationsans", "arimo", "notosans"],
     "arialnarrow": ["liberationsansnarrow", "liberationsans"],
@@ -166,7 +174,11 @@ _SANS_HINT = re.compile(
     r"ubuntu|arial|helvet|calibri|roboto|open ?sans|segoe|verdana|tahoma|lato|inter|poppins|"
     r"montserrat|nunito|noto ?sans|source ?sans|dejavu ?sans|liberation ?sans|sans|gothic|mukta|hind"
 )
-_SERIF_HINT = re.compile(r"times|serif|georgia|roman|garamond|palatino|minion|cambria|book ?antiqua|baskerville|lora|merriweather")
+# _SERIF_HINT = re.compile(r"times|serif|georgia|roman|garamond|palatino|minion|cambria|book ?antiqua|baskerville|lora|merriweather")
+_SERIF_HINT = re.compile(
+    r"times|serif|georgia|roman|garamond|palatino|minion|cambria|book ?antiqua|"
+    r"baskerville|lora|merriweather|cmr|cmbx|cmti|termes|nimbusrom"
+)
 
 
 def base14(name: str, flags: int) -> str:
