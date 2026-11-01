@@ -3,7 +3,7 @@ import re
 import pymupdf as fitz
 from typing import List, Tuple, Optional
 
-from services.spatial_cluster import ParagraphBlock, BULLET_CHARS
+from services.spatial_cluster import ParagraphBlock, BULLET_CHARS, visible_extent
 from services.obj_reflow import ReflowResult
 from services.markers import find_markers, visible_right_edge, place_line, split_marker
 from services.erase_service import (safe_erase, erase_underline_rect, remove_underline, draw_underline,
@@ -114,6 +114,28 @@ def compute_empirical_width_scale(page, doc, block: ParagraphBlock, cache: dict)
     return max(0.94, min(1.08, ratio))
 
 
+_BORDER_RELATIVE = None
+
+
+def _border_is_relative() -> bool:
+    """Is PyMuPDF's insert_text(border_width=...) a multiple of the font size, or plain points? It differs between
+    versions / docs, so measure it once: stroke a big letter with border_width 0.1. 0.1 pt is a hairline (few dark
+    pixels), 0.1 x fontsize (6 pt) is a thick blob."""
+    global _BORDER_RELATIVE
+    if _BORDER_RELATIVE is None:
+        try:
+            d = fitz.open()
+            pg = d.new_page(width=120, height=120)
+            pg.insert_text((20, 90), "I", fontsize=60, color=(0, 0, 0), render_mode=1, border_width=0.1)
+            pix = pg.get_pixmap(dpi=72, colorspace=fitz.csGRAY)
+            ink = sum(1 for v in pix.samples if v < 128)
+            d.close()
+            _BORDER_RELATIVE = ink > 250
+        except Exception:
+            _BORDER_RELATIVE = False
+    return _BORDER_RELATIVE
+
+
 def draw_pieces(page, x, y, pieces, st: Style, fallback_code, cache, extra_space_w: float = 0.0,
                 original_underline_rects: Optional[List[tuple]] = None) -> float:
     color = rgb(st.color)
@@ -125,9 +147,15 @@ def draw_pieces(page, x, y, pieces, st: Style, fallback_code, cache, extra_space
                 kw = {}
                 if id(pc.ent[0]) in cache.get("synth_i", ()):
                     kw["morph"] = (fitz.Point(x, y), fitz.Matrix(1, 0, -0.2, 1, 0, 0))   # ~11 degree slant about the baseline
-                if id(pc.ent[0]) in cache.get("synth", ()):
+                # outline (fill + stroke): the PDF's own faux-bold stroke, or a thin one when a bold had to be faked.
+                # `fill` must be given too: with render mode 2 an omitted fill is BLACK, not the text colour.
+                size = max(float(st.size), 1.0)
+                stroke_pts = max(float(getattr(st, "stroke", 0.0) or 0.0),
+                                 0.03 * size if id(pc.ent[0]) in cache.get("synth", ()) else 0.0)
+                if stroke_pts > 0:
+                    bw = stroke_pts / size if _border_is_relative() else stroke_pts
                     page.insert_text((x, y), pc.text, fontname=res_name, fontsize=st.size,
-                                     color=color, render_mode=2, border_width=0.03, **kw)
+                                     color=color, fill=color, render_mode=2, border_width=bw, **kw)
                 else:
                     page.insert_text((x, y), pc.text, fontname=res_name, fontsize=st.size, color=color, **kw)
             except Exception:
@@ -287,6 +315,13 @@ class PDFCompiler:
                 and is_numeric_cell(new_text) and is_numeric_cell(target_block.text)
                 and looks_right_aligned(target_block, all_blocks)):
             plan[0][0] = target_x1 - plan[0][3]
+        elif (len(plan) == 1 and len(target_block.lines) == 1
+                and getattr(target_block, "alignment", "left") == "center"):
+            # centred one-liner (a title): keep the ORIGINAL centre, whatever the new width is
+            vx0, vx1 = visible_extent(target_block)                      # centre of the VISIBLE glyphs
+            blanks = len(new_text) - len(new_text.strip())               # blanks at the ends do not count
+            vis_w = plan[0][3] - blanks * 0.27 * float(default.size)
+            plan[0][0] = (vx0 + vx1) / 2.0 - vis_w / 2.0
 
         # ---- 2a. Vector art below the edit (table borders, shading, rules, underlines) must follow the text
         drawings_to_move = []

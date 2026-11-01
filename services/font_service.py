@@ -57,17 +57,18 @@ _STYLES = {
 def split_style(name: str):
     """'ABCDEF+Ubuntu-BoldItalic' -> ('ubuntu', bold, italic, weight).
     Understands Ubuntu-R / Ubuntu-BI, Arial-BoldMT, 'Open Sans Bold', ArialBold ..."""
-    n = name.split("+", 1)[-1].strip()
+    n = name.split("+", 1)[-1].strip().replace("_", "-")
     fam, tok = n, ""
-    m = re.match(r"^(.*?)[-,_ ]+([A-Za-z]+)$", n)
+    m = re.match(r"^(.*?)[-,_ ]+([A-Za-z0-9]+)$", n)
     if m:
         t = re.sub(r"(psmt|mt)$", "", m.group(2).lower())
         if t in _STYLES:
             fam, tok = m.group(1), t
     else:
-        m = re.match(r"^(.*?)(bolditalic|boldoblique|semibold|demibold|extrabold|bold|italic|oblique)(?:psmt|mt)?$", n, re.I)
+        m = re.match(r"^(.*?)(bolditalic|boldoblique|semibold|demibold|extrabold|bold|italic|oblique|book|regular)(?:psmt|mt)?$", n, re.I)
         if m and m.group(1):
             fam, tok = m.group(1), m.group(2).lower()
+
     fam = re.sub(r"(psmt|mt)$", "", re.sub(r"[^a-z0-9]", "", fam.lower()))
     b, i, w = _STYLES.get(tok, (0, 0, "regular"))
     return fam, bool(b), bool(i), w
@@ -109,6 +110,7 @@ def sys_fonts():
 # Commercial / unavailable font family -> free look-alikes, tried in order. These are
 # metric-compatible (same letter widths), so a substituted edit keeps the layout.
 ALIASES = {
+    "franklingothic": ["librefranklin", "notosans", "liberationsans"],
     "arial": ["liberationsans", "arimo", "notosans"],
     "arialnarrow": ["liberationsansnarrow", "liberationsans"],
     "helvetica": ["liberationsans", "arimo", "notosans"],

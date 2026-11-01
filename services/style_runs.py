@@ -1,3 +1,4 @@
+import dataclasses
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import List, Tuple
@@ -10,6 +11,7 @@ class Style:
     size: float
     color: int = 0
     underline: bool = False
+    stroke: float = 0.0      # pt: the PDF draws this text fill + OUTLINE (faux bold); a redraw must repeat it
 
 
 @dataclass
@@ -28,6 +30,7 @@ def style_of(tok) -> Style:
         round(float(tok.font_size), 3),
         int(tok.color or 0),
         bool(getattr(tok, "underline", False)),
+        round(float(getattr(tok, "stroke", 0.0) or 0.0), 4),
     )
 
 
@@ -103,12 +106,12 @@ def new_char_styles(old_text: str, old_styles: List[Style], new_text: str) -> Li
                 base_st = old_styles[min(i1 + k, i2 - 1)]
                 # If editing an underlined link, preserve underline on replacement text
                 if has_any_underline and not base_st.underline:
-                    base_st = Style(base_st.font, base_st.flags, base_st.size, base_st.color, True)
+                    base_st = dataclasses.replace(base_st, underline=True)
                 out.append(base_st)
         elif tag == "insert":
             st = _neighbour_style(old_text, old_styles, i1, dominant)
             if has_any_underline and not st.underline:
-                st = Style(st.font, st.flags, st.size, st.color, True)
+                st = dataclasses.replace(st, underline=True)
             out.extend([st] * (j2 - j1))
     if len(out) != len(new_text):
         return [dominant] * len(new_text)
@@ -178,7 +181,7 @@ def _fmt(st, m: dict):
         font = f"{fam}-{tail}" if (tail and fam) else (fam or st.font)
     flags = (flags | 16) if want_b else (flags & ~16)
     flags = (flags | 2) if want_i else (flags & ~2)
-    return Style(font, flags, m.get("z", st.size), m.get("c", st.color), m.get("u", st.underline))
+    return Style(font, flags, m.get("z", st.size), m.get("c", st.color), m.get("u", st.underline), st.stroke)
 
 
 def apply_marks(styles, marks: list):

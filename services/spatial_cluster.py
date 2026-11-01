@@ -73,6 +73,7 @@ class CharToken:
     color: int = 0
     underline: bool = False
     seq_id: int = 0
+    stroke: float = 0.0
 
 
 @dataclass
@@ -309,6 +310,61 @@ def _has_h_barrier(y_top_line: float, y_bot_line: float, x_left: float, x_right:
             if overlap_x >= 0.25 * max(1.0, min(x_right - x_left, hx1 - hx0)):
                 return True
     return False
+
+
+def visible_extent(block):
+    """(x0, x1) of the VISIBLE glyphs of a block (a trailing blank glyph must not move the centre)."""
+    xs0, xs1 = [], []
+    for ln in block.lines:
+        for t in ln.tokens:
+            if not t.char.isspace() and (t.bbox[2] - t.bbox[0]) > 0.3:
+                xs0.append(t.bbox[0])
+                xs1.append(t.bbox[2])
+    if not xs0:
+        return block.bbox[0], block.bbox[2]
+    return min(xs0), max(xs1)
+
+
+def mark_centered_single_line(block, page_width: float, tol: float = 3.0) -> None:
+    """Page rule: a one-line block whose middle sits on the page's middle (wide side margins) is centred."""
+    if len(block.lines) != 1 or getattr(block, "alignment", "left") != "left":
+        return
+    x0, x1 = visible_extent(block)
+    w = x1 - x0
+    if w < 20.0 or w > 0.8 * page_width:
+        return
+    if abs((x0 + x1) / 2.0 - page_width / 2.0) <= tol and x0 > 0.1 * page_width and (page_width - x1) > 0.1 * page_width:
+        block.alignment = "center"
+
+
+def mark_centered_blocks(blocks, page_width: float, pair_tol: float = 1.0) -> None:
+    """A one-line block has no second line to compare against, so it was always called 'left'. It is CENTRED when
+      - its middle is the page's middle (page rule), or
+      - another one-line block has the same middle (+-1 pt) but different left AND right edges, while nothing on
+        the page shares this block's left edge (a column of left-aligned text always shares one).
+    The second rule covers text centred in a column / frame that is not the page (a letterhead with a side bar)."""
+    singles = [b for b in blocks if len(b.lines) == 1]
+    ext = {id(b): visible_extent(b) for b in singles}
+    for b in singles:
+        if getattr(b, "alignment", "left") != "left":
+            continue
+        mark_centered_single_line(b, page_width)
+        if b.alignment != "left":
+            continue
+        x0, x1 = ext[id(b)]
+        if x1 - x0 < 20.0:
+            continue
+        c = (x0 + x1) / 2.0
+        shares_left = any(o is not b and abs(visible_extent(o)[0] - x0) <= 1.5 for o in blocks)
+        if shares_left:
+            continue
+        for o in singles:
+            if o is b:
+                continue
+            ox0, ox1 = ext[id(o)]
+            if abs((ox0 + ox1) / 2.0 - c) <= pair_tol and abs(ox0 - x0) > 4.0 and abs(ox1 - x1) > 4.0:
+                b.alignment = "center"
+                break
 
 
 class SpatialClusterer:
@@ -578,6 +634,7 @@ class SpatialClusterer:
                                 flags=f_flags,
                                 color=int(span.get("color") or 0),
                                 seq_id=seq,
+                                stroke=float(span.get("stroke") or 0.0),
                             )
                         )
                         seq += 1
@@ -588,6 +645,8 @@ class SpatialClusterer:
 
         lines = self.cluster_characters_into_lines(tokens, v_barriers=v_barriers)
         h_barriers = self._attach_underlines_and_filter_barriers(lines, h_segments)
-        return self.cluster_lines_into_paragraphs(
+        blocks = self.cluster_lines_into_paragraphs(
             lines, h_barriers=h_barriers, v_barriers=v_barriers, page_width=page_width
         )
+        mark_centered_blocks(blocks, page_width)
+        return blocks

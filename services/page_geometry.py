@@ -91,6 +91,30 @@ def _extract_vector_primitives(
     return h_segments, v_barriers, boxes
 
 
+def _stroke_traces(page: fitz.Page):
+    """Text painted as OUTLINE (render mode 1 or 2 with a line width) -> [(bbox, size, line width)]. Producers use
+    it as a faux bold: the same text is drawn once filled and once stroked. Rebuilding that text as plain fill
+    looks ~40% thinner, so the width is carried on the span and repeated when the text is drawn again."""
+    out = []
+    try:
+        for tr in page.get_texttrace():
+            lw = tr.get("linewidth")
+            if tr.get("type") in (1, 2) and lw and lw > 0:
+                out.append((fitz.Rect(tr["bbox"]), float(tr.get("size") or 0.0), float(lw)))
+    except Exception:
+        pass
+    return out
+
+
+def _stroke_for(span_bbox, size, traces) -> float:
+    r = fitz.Rect(span_bbox)
+    cx, cy = (r.x0 + r.x1) / 2.0, (r.y0 + r.y1) / 2.0
+    for tb, ts, lw in traces:
+        if tb.x0 - 1.0 <= cx <= tb.x1 + 1.0 and tb.y0 - 1.0 <= cy <= tb.y1 + 1.0 and abs(ts - float(size or 0)) < 0.6:
+            return lw
+    return 0.0
+
+
 def extract_page_geometry(
     pdf_source: Union[str, fitz.Document], page_number: int = 0, ghost: Optional[list] = None
 ) -> Dict[str, Any]:
@@ -109,6 +133,7 @@ def extract_page_geometry(
 
     h_segments, v_barriers, boxes = _extract_vector_primitives(page)
 
+    stroke_traces = _stroke_traces(page)
     extracted_blocks = []
     for block in page_data.get("blocks", []):
         if block.get("type") != 0:
@@ -128,6 +153,7 @@ def extract_page_geometry(
                     "size": span.get("size"),
                     "color": span.get("color"),
                     "flags": span.get("flags"),
+                    "stroke": _stroke_for(span.get("bbox", line["bbox"]), span.get("size"), stroke_traces) if stroke_traces else 0.0,
                     "chars": [],
                 }
                 for char in span.get("chars", []):
