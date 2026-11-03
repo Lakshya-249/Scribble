@@ -6,7 +6,7 @@ services:
       - "8005:8000"
     environment:
       # REQUIRED when hosted: the public host name(s), comma separated. Requests for any other Host are refused.
-      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1,scrible.slingshot.quest,www.scrible.slingshot.quest}
       # Set to 1 once the site is served over HTTPS.
       - COOKIE_SECURE=${COOKIE_SECURE:-0}
       - MAX_SESSIONS=${MAX_SESSIONS:-50}
