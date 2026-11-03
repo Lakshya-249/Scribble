@@ -850,31 +850,75 @@ dialog .btn.fill { color: white; border-color: var(--accent); }
   .fmtbar::-webkit-scrollbar { display: none; }
 }
 
+/* ---- phones ---- */
 @media (max-width: 640px) {
-  header {
-    height: auto; min-height: 0; flex-wrap: wrap; row-gap: 8px;
-    padding: calc(8px + env(safe-area-inset-top, 0px)) calc(10px + env(safe-area-inset-right, 0px)) 8px calc(10px + env(safe-area-inset-left, 0px));
-  }
-  .brand { order: 1; }
-  .right { order: 2; margin-left: auto; }
-  .tools { order: 3; width: 100%; }
+  :root { --dock-h: 62px; }
 
+  /* slim single-row header */
+  header {
+    height: calc(54px + env(safe-area-inset-top, 0px)); min-height: 0;
+    flex-wrap: nowrap;
+    padding: env(safe-area-inset-top, 0px) calc(12px + env(safe-area-inset-right, 0px)) 0 calc(12px + env(safe-area-inset-left, 0px));
+  }
+  body:not(.has-doc) .brand span.w { display: inline; }
+  #bSave .lbl { display: inline; }
+  #bSave { height: 38px; padding: 0 14px; }
+  #bWipe { display: inline-flex; }
+  body:not(.has-doc) #bSave, body:not(.has-doc) #bWipe { display: none; }
+
+  /* tools become a bottom dock */
+  .tools {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+    width: auto; gap: 2px; overflow-x: auto;
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px));
+    border-radius: 18px 18px 0 0; border-width: 1px 0 0;
+    background: var(--dark);
+    box-shadow: 0 -8px 24px rgba(0,0,0,0.22);
+  }
+  .tools .sep, #bZout, #zlab, #bZin { display: none; }
+  .tools .btn, .tools .btn.icon {
+    flex: 1 1 0; min-width: 32px; width: auto; height: 46px; padding: 0;
+  }
+  .tools .btn svg.i { width: 20px; height: 20px; }
+  body:not(.has-doc) .tools { display: none; }
+
+  /* while typing: free the screen for the keyboard */
+  body:has(.editor) .tools { display: none; }
+  body:has(.editor) header { visibility: hidden; }
+
+  /* room for the dock */
+  #pages { padding-bottom: calc(var(--dock-h) + 90px); }
+  #side { bottom: calc(var(--dock-h) + env(safe-area-inset-bottom, 0px)); }
+  #toasts { bottom: calc(var(--dock-h) + 14px + env(safe-area-inset-bottom, 0px)); }
+
+  /* sub bars */
   .subbar { justify-content: flex-start; padding: 8px 12px; gap: 10px; }
-  #optAdd, #findbar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
-  #optAdd::-webkit-scrollbar, #findbar::-webkit-scrollbar { display: none; }
-  #optAdd > *, #findbar > * { flex: none; }
+  #optAdd { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  #optAdd::-webkit-scrollbar { display: none; }
+  #optAdd > * { flex: none; }
   #optAdd .hint { display: none; }
+  #findbar { flex-wrap: nowrap; gap: 6px; }
+  #findbar > * { flex: none; }
+  #findIn { flex: 1 1 auto; min-width: 0; width: auto; }
+  #findcount { min-width: 54px; }
   #optMsg .hint { white-space: normal; }
 
-  .drop-copy h1 { margin-bottom: 16px; }
+  /* landing: copy only, no clipped artwork */
+  #landing { padding: 14px; }
+  .drop { border-radius: 16px; min-height: 0; }
+  .drop-art { display: none; }
+  .drop-copy { padding: 30px 22px 24px; }
+  .drop h1 { font-size: 44px; margin-bottom: 14px; }
+  .drop p.sub { font-size: 14px; margin-bottom: 22px; }
   .drop .btn.fill { width: 100%; }
+  .chips { margin-top: 24px; padding-top: 20px; }
   dialog { padding: 24px; }
 }
 
+/* ---- touch devices ---- */
 @media (pointer: coarse) {
-  .btn { height: 40px; }
-  .btn.icon { width: 40px; }
   .subbar .btn { height: 40px; }
+  .subbar .btn.icon { width: 40px; }
   .subbar select, .subbar input[type=number], .subbar input[type=search] { height: 40px; font-size: 16px; }
   .subbar input[type=color] { width: 40px; height: 40px; }
   .swatch { width: 34px; height: 34px; }
@@ -895,8 +939,8 @@ dialog .btn.fill { color: white; border-color: var(--accent); }
     border-radius: 99px; box-shadow: 0 12px 30px rgba(0,0,0,0.35);
   }
   .touchact button {
-    height: 38px; padding: 0 20px; border: 0; border-radius: 99px;
-    background: transparent; color: #e9e4d9; font-weight: 600; font-size: 13px;
+    height: 40px; padding: 0 22px; border: 0; border-radius: 99px;
+    background: transparent; color: #e9e4d9; font-weight: 600; font-size: 13.5px;
   }
   .touchact button.ok { background: linear-gradient(180deg, var(--accent-bright), var(--accent)); color: #fff; }
 }
