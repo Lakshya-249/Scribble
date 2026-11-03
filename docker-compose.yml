@@ -3,7 +3,7 @@ services:
     build: .
     container_name: scribble
     ports:
-      - "8000:8000"
+      - "8000:8002"
     environment:
       # REQUIRED when hosted: the public host name(s), comma separated. Requests for any other Host are refused.
       - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1}
