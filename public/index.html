@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light">
 <meta name="description" content="Scrible edits PDF text in your browser.">
 <title>Scrible — The PDF Editing Studio</title>
@@ -835,6 +835,70 @@ dialog .btn.fill { color: white; border-color: var(--accent); }
     animation-duration: .01ms !important;
     transition-duration: .01ms !important;
   }
+}
+
+/* ─── Mobile optimisation (additive only) ─────────────── */
+@supports (height: 100dvh) { html, body { height: 100dvh; } }
+#ws { touch-action: pan-x pan-y; -webkit-overflow-scrolling: touch; }
+.touchact { display: none; }
+
+@media (max-width: 860px) {
+  #side { width: min(78vw, 260px); }
+  #landing { place-items: unset; }
+  .drop { margin: auto; }
+  .fmtbar { max-width: calc(100vw - 24px); overflow-x: auto; scrollbar-width: none; }
+  .fmtbar::-webkit-scrollbar { display: none; }
+}
+
+@media (max-width: 640px) {
+  header {
+    height: auto; min-height: 0; flex-wrap: wrap; row-gap: 8px;
+    padding: calc(8px + env(safe-area-inset-top, 0px)) calc(10px + env(safe-area-inset-right, 0px)) 8px calc(10px + env(safe-area-inset-left, 0px));
+  }
+  .brand { order: 1; }
+  .right { order: 2; margin-left: auto; }
+  .tools { order: 3; width: 100%; }
+
+  .subbar { justify-content: flex-start; padding: 8px 12px; gap: 10px; }
+  #optAdd, #findbar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  #optAdd::-webkit-scrollbar, #findbar::-webkit-scrollbar { display: none; }
+  #optAdd > *, #findbar > * { flex: none; }
+  #optAdd .hint { display: none; }
+  #optMsg .hint { white-space: normal; }
+
+  .drop-copy h1 { margin-bottom: 16px; }
+  .drop .btn.fill { width: 100%; }
+  dialog { padding: 24px; }
+}
+
+@media (pointer: coarse) {
+  .btn { height: 40px; }
+  .btn.icon { width: 40px; }
+  .subbar .btn { height: 40px; }
+  .subbar select, .subbar input[type=number], .subbar input[type=search] { height: 40px; font-size: 16px; }
+  .subbar input[type=color] { width: 40px; height: 40px; }
+  .swatch { width: 34px; height: 34px; }
+  .fb { height: 36px; min-width: 36px; }
+  .fsize { height: 34px; font-size: 16px; width: 60px; }
+  .fcol { width: 30px; height: 30px; }
+  .tact button { width: 34px; height: 34px; }
+  .toast button { padding: 8px 12px; }
+  dialog input { font-size: 16px; height: 46px; }
+  dialog .btn { height: 44px; }
+  .drop-hint, .edhint { display: none; }
+
+  .touchact {
+    display: flex; gap: 6px; padding: 6px;
+    position: fixed; z-index: 220; left: 50%; transform: translateX(-50%);
+    top: calc(env(safe-area-inset-top, 0px) + 10px);
+    background: var(--dark); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 99px; box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+  }
+  .touchact button {
+    height: 38px; padding: 0 20px; border: 0; border-radius: 99px;
+    background: transparent; color: #e9e4d9; font-weight: 600; font-size: 13px;
+  }
+  .touchact button.ok { background: linear-gradient(180deg, var(--accent-bright), var(--accent)); color: #fff; }
 }
 </style>
 </head>
@@ -1943,7 +2007,7 @@ function closeEditor(commit) {
 }
 
 document.addEventListener("pointerdown", e => {
-  if (S.editor && !S.editor.ta.contains(e.target) && !e.target.closest(".fmtbar, .fmtprev")) closeEditor(true);
+  if (S.editor && !S.editor.ta.contains(e.target) && !e.target.closest(".fmtbar, .fmtprev", ".touchact")) closeEditor(true);
 }, true);
 
 function reportMissing(r) {
@@ -2567,6 +2631,46 @@ addEventListener("keydown", e => {
   setMode("edit");
   $("#zlab").textContent = "100%";
 })();
+
+
+/* ============================== mobile / touch additions ============================== */
+
+/* Cancel / Apply pill, since touch keyboards have no Ctrl+Enter or Esc */
+const COARSE = matchMedia("(pointer: coarse)");
+function addTouchActions() {
+  if (!COARSE.matches || !S.editor) return;
+  $$(".touchact").forEach(x => x.remove());
+  document.body.append(el("div", { class: "touchact" },
+    el("button", { type: "button", onclick: () => closeEditor(false) }, "Cancel"),
+    el("button", { type: "button", class: "ok", onclick: () => closeEditor(true) }, "Apply")
+  ));
+}
+const _openBlock = openBlockEditor;
+openBlockEditor = function (...a) { _openBlock(...a); addTouchActions(); };
+const _openAdd = openAddEditor;
+openAddEditor = function (...a) { _openAdd(...a); addTouchActions(); };
+const _closeEd = closeEditor;
+closeEditor = function (c) { _closeEd(c); $$(".touchact").forEach(x => x.remove()); };
+
+/* Pinch-to-zoom on the document (one finger still scrolls natively) */
+(() => {
+  let d0 = 0;
+  const dist = t => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  ws.addEventListener("touchstart", e => { if (e.touches.length === 2) d0 = dist(e.touches); }, { passive: true });
+  ws.addEventListener("touchmove", e => {
+    if (e.touches.length !== 2 || !d0) return;
+    e.preventDefault();
+    const d = dist(e.touches);
+    zoomBy(d / d0);
+    d0 = d;
+  }, { passive: false });
+  ws.addEventListener("touchend", e => { if (e.touches.length < 2) d0 = 0; }, { passive: true });
+})();
+
+/* Tapping the document closes the thumbnail drawer on small screens */
+ws.addEventListener("pointerdown", () => {
+  if (innerWidth <= 860) document.body.classList.add("side-off");
+}, { passive: true });
 </script>
 </body>
 </html>
